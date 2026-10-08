@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Hue Tap</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none}
+  body{background:hsl(200,70%,55%);transition:background-color .35s ease;cursor:pointer}
+</style>
+</head>
+<body>
+<script>
+  let hue = Math.floor(Math.random()*360);
+  const paint = () => {
+    const c = `hsl(${hue},70%,55%)`;
+    document.body.style.backgroundColor = c;
+    document.querySelector('meta[name=theme-color]')?.setAttribute('content', c);
+  };
+  const m = document.createElement('meta'); m.name='theme-color'; document.head.appendChild(m);
+  paint();
+  document.addEventListener('pointerdown', () => {
+    hue = (hue + 40 + Math.floor(Math.random()*240)) % 360;
+    paint();
+  });
+</script>
+</body>
+</html>
