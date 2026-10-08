@@ -488,39 +488,153 @@
     dirty = true;
   }
 
-  // ----- Hunters: each frame, head straight for the nearest circle; touching pops it -----
+  // ----- Hunters: each frame every hunter heads straight for the nearest circle
+  // no other hunter has claimed; touching pops it -----
+  const HUNT_K = 16;   // candidates kept per hunter when sharing out targets
+  // Gap from a hunter's edge to a circle's edge (negative = touching), with the
+  // direction to move. Huge circles: distance to their straight-looking edge.
+  const gapDir = { g: 0, ux: 0, uy: 0 };
+  function gapTo(h, c) {
+    if (!c.big) {
+      const dx = c.cx - h.cx, dy = c.cy - h.cy, d = Math.sqrt(dx * dx + dy * dy);
+      gapDir.g = d - c.r - h.r; gapDir.ux = d > 0 ? dx / d : 0; gapDir.uy = d > 0 ? dy / d : 0;
+    } else {
+      gapDir.g = -((h.cx - c.ox) * c.nx + (h.cy - c.oy) * c.ny) - h.r; gapDir.ux = c.nx; gapDir.uy = c.ny;
+    }
+    return gapDir.g;
+  }
+  // A grid over the circles, rebuilt each frame, so finding the circles nearest a
+  // hunter only looks at nearby cells. Circles bigger than a cell (and huge ones)
+  // are always checked directly.
+  let grid = null;   // {x0, y0, cs, nx, ny, cells, always}
+  function buildGrid(elig) {
+    grid = null;
+    if (elig.length < 64) return;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, maxR = 0, n = 0;
+    for (const c of elig) {
+      if (c.big || !isFinite(c.cx) || !isFinite(c.cy)) continue;
+      if (c.cx < x0) x0 = c.cx; if (c.cx > x1) x1 = c.cx; if (c.cy < y0) y0 = c.cy; if (c.cy > y1) y1 = c.cy;
+      if (c.r > maxR) maxR = c.r; n++;
+    }
+    if (n < 64) return;
+    const w = x1 - x0, h = y1 - y0;
+    let cs = Math.sqrt(w * h / n) * 1.5;
+    if (!(cs > 0) || !isFinite(cs)) cs = Math.max(w, h) / 16;
+    if (!(cs > 0) || !isFinite(cs)) cs = maxR > 0 ? maxR : 1;
+    cs = Math.max(cs, w / 128, h / 128);
+    const nx = Math.floor(w / cs) + 1, ny = Math.floor(h / cs) + 1;
+    const cells = new Array(nx * ny), always = [];
+    for (const c of elig) {
+      if (c.big || !(c.r <= cs) || !isFinite(c.cx) || !isFinite(c.cy)) { always.push(c); continue; }
+      const i = Math.min(nx - 1, Math.floor((c.cx - x0) / cs)) + nx * Math.min(ny - 1, Math.floor((c.cy - y0) / cs));
+      (cells[i] || (cells[i] = [])).push(c);
+    }
+    grid = { x0, y0, cs, nx, ny, cells, always };
+  }
+  // The K nearest circles to hunter h that aren't in `skip`, nearest first.
+  function kNearest(h, list, skip, K) {
+    const gs = [], cs = [];
+    let worst = Infinity;
+    const consider = (c) => {
+      if (skip && skip.has(c)) return;
+      if (!c.big && gs.length === K) {                        // cheap reject before the square root
+        const lim = worst + c.r + h.r;
+        if (Math.abs(c.cx - h.cx) > lim || Math.abs(c.cy - h.cy) > lim) return;
+      }
+      const g = gapTo(h, c);
+      if (gs.length === K && g >= worst) return;
+      let i = gs.length < K ? gs.length : K - 1;
+      while (i > 0 && gs[i - 1] > g) { gs[i] = gs[i - 1]; cs[i] = cs[i - 1]; i--; }
+      gs[i] = g; cs[i] = c;
+      if (gs.length === K) worst = gs[K - 1];
+    };
+    const G = grid;
+    if (!G || list !== G.list) { for (const c of list) consider(c); return { gs, cs }; }
+    for (const c of G.always) consider(c);
+    // Rings of cells around the hunter, nearest first, until no closer circle is possible.
+    const hx = Math.floor((h.cx - G.x0) / G.cs), hy = Math.floor((h.cy - G.y0) / G.cs);
+    const kmin = Math.max(0, -hx, hx - (G.nx - 1), -hy, hy - (G.ny - 1));
+    const kmax = Math.max(hx, G.nx - 1 - hx, hy, G.ny - 1 - hy);
+    const cell = (x, y) => { const a = G.cells[x + G.nx * y]; if (a) for (const c of a) consider(c); };
+    for (let k = kmin; k <= kmax; k++) {
+      if (gs.length === K && (k - 1) * G.cs - G.cs - h.r > worst) break;   // everything further is too far
+      const xa = Math.max(0, hx - k), xb = Math.min(G.nx - 1, hx + k);
+      if (hy - k >= 0 && hy - k < G.ny) for (let x = xa; x <= xb; x++) cell(x, hy - k);
+      if (k > 0 && hy + k >= 0 && hy + k < G.ny) for (let x = xa; x <= xb; x++) cell(x, hy + k);
+      const ya = Math.max(0, hy - k + 1), yb = Math.min(G.ny - 1, hy + k - 1);
+      if (k > 0 && hx - k >= 0 && hx - k < G.nx) for (let y = ya; y <= yb; y++) cell(hx - k, y);
+      if (k > 0 && hx + k >= 0 && hx + k < G.nx) for (let y = ya; y <= yb; y++) cell(hx + k, y);
+    }
+    return { gs, cs };
+  }
+  // Share out targets: repeatedly take the closest hunter–circle pair overall and
+  // pair them off. Each hunter only offers its K nearest unclaimed circles; if a
+  // hunter's offers all get taken, the round stops before any pair that hunter
+  // might beat, and it gets fresh offers next round, so the result is the same
+  // as checking every pair.
+  function assignTargets(active, elig, claimed) {
+    let open = active;
+    while (open.length && claimed.size < elig.length) {
+      const pairs = [], listers = new Map();
+      for (const h of open) {
+        const { gs, cs } = kNearest(h, elig, claimed, HUNT_K);
+        h._left = gs.length; h._kgap = gs.length === HUNT_K ? gs[HUNT_K - 1] : Infinity;
+        for (let i = 0; i < gs.length; i++) {
+          pairs.push({ g: gs[i], h, c: cs[i] });
+          const l = listers.get(cs[i]); if (l) l.push(h); else listers.set(cs[i], [h]);
+        }
+      }
+      if (!pairs.length) break;
+      pairs.sort((p, q) => p.g - q.g);
+      let bound = Infinity;
+      for (const p of pairs) {
+        if (p.g > bound) break;
+        if (p.h.target || claimed.has(p.c)) continue;
+        p.h.target = p.c; claimed.add(p.c);
+        for (const l of listers.get(p.c)) if (!l.target && --l._left === 0) bound = Math.min(bound, l._kgap);
+      }
+      open = open.filter(h => !h.target);
+    }
+    return open;   // hunters left without an unclaimed circle
+  }
+  function nearestFree(h, elig, skip) { const { cs } = kNearest(h, elig, skip, 1); return cs[0] || null; }
+
   function huntStep(dt, now) {
     if (!hunters.length) return;
     const held = press && press.circle;
+    const active = [];
+    for (const h of hunters) {
+      h.target = null;
+      if (!h.big && h.r > 0 && isFinite(h.cx) && isFinite(h.cy)) active.push(h);   // huge hunters wait until zoomed out
+    }
+    if (!active.length || !circles.length) return;
+    const elig = circles.filter(c => c !== held && c.r > 0);
+    if (!elig.length) return;
+    buildGrid(elig); if (grid) grid.list = elig;
+    const claimed = new Set();
+    // More hunters than circles: the spare ones chase the nearest circle anyway.
+    for (const h of assignTargets(active, elig, claimed)) h.target = nearestFree(h, elig, null);
     let popped = null;
     const born = [];
-    for (const h of hunters) {
-      if (h.big || !(h.r > 0) || !isFinite(h.cx) || !isFinite(h.cy)) continue;  // huge hunters wait until zoomed out
-      let step = HUNTER_SPEED * h.r * dt;
+    for (const h of active) {
+      let step = HUNTER_SPEED * h.r * dt, tgt = h.target;
       // Up to a few pops per frame if circles are packed tight; each move is a
       // straight line to the target's edge, so a fast hunter can't skip past it.
       for (let k = 0; k < 4 && step > 0; k++) {
-        let best = null, bestGap = Infinity, bx = 0, by = 0;
-        for (const c of circles) {
-          if (c === held || !(c.r > 0) || (popped && popped.has(c))) continue;
-          let gap, ux, uy;
-          if (!c.big) {
-            const dx = c.cx - h.cx, dy = c.cy - h.cy;
-            if (Math.abs(dx) - c.r - h.r > bestGap || Math.abs(dy) - c.r - h.r > bestGap) continue;
-            const d = Math.sqrt(dx * dx + dy * dy);
-            gap = d - c.r - h.r; ux = d > 0 ? dx / d : 0; uy = d > 0 ? dy / d : 0;
-          } else {
-            gap = -((h.cx - c.ox) * c.nx + (h.cy - c.oy) * c.ny) - h.r;   // distance to a huge circle's edge
-            ux = c.nx; uy = c.ny;
-          }
-          if (gap < bestGap) { bestGap = gap; best = c; bx = ux; by = uy; }
+        if (tgt && popped && popped.has(tgt)) tgt = null;          // someone else got it first
+        if (!tgt) {
+          tgt = nearestFree(h, elig, claimed) || nearestFree(h, elig, popped);
+          if (!tgt) break;
+          claimed.add(tgt);
         }
-        if (!best) break;
-        if (bestGap > step) { h.cx += bx * step; h.cy += by * step; break; }
-        const go = Math.max(0, bestGap);
-        h.cx += bx * go; h.cy += by * go; step -= go;
-        (popped || (popped = new Set())).add(best);
-        if (!best.big) pops.push({ x: best.cx, y: best.cy, r: best.r, color: best.color, t0: now });
+        h.target = tgt;
+        const g = gapTo(h, tgt), ux = gapDir.ux, uy = gapDir.uy;
+        if (g > step) { h.cx += ux * step; h.cy += uy * step; break; }
+        const go = Math.max(0, g);
+        h.cx += ux * go; h.cy += uy * go; step -= go;
+        (popped || (popped = new Set())).add(tgt); claimed.add(tgt);
+        if (!tgt.big) pops.push({ x: tgt.cx, y: tgt.cy, r: tgt.r, color: tgt.color, t0: now });
+        tgt = null; h.target = null;
         // Every 20th pop the hunter clones itself, 2.5 radii away in a random direction.
         h.popCount = (h.popCount || 0) + 1;
         if (h.popCount >= CLONE_EVERY) {
