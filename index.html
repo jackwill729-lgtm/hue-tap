@@ -10,7 +10,7 @@
 <style>
   html,body{margin:0;height:100%;overflow:hidden;touch-action:none;overscroll-behavior:none;
     -webkit-tap-highlight-color:transparent;-webkit-touch-callout:none;user-select:none;-webkit-user-select:none}
-  body{background:hsl(200,70%,55%);transition:background-color .35s ease;cursor:pointer}
+  body{background:hsl(170,70%,55%);transition:background-color .35s ease;cursor:pointer}
   canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
 </style>
 </head>
@@ -21,14 +21,27 @@
   const GROW_PX_PER_S = 160;   // how fast a circle's radius grows, in screen pixels
 
   // ----- Colour -----
-  let hue = Math.floor(Math.random() * 360);
+  // Circle colours. The background is never allowed near these two hues.
+  const RED = '#E53935';   // hue about 1
+  const BLUE = '#1E5BFF';  // hue about 224
+  const WHITE = '#FFFFFF';
+  const DOUBLE_TAP_MS = 350;
+  const allowedHue = (h) => !(h >= 335 || h <= 25) && !(h >= 195 && h <= 255);
+  function randomAllowedHue(avoid) {
+    for (;;) {
+      const h = Math.floor(Math.random() * 360);
+      const gap = avoid == null ? 180 : Math.min(Math.abs(h - avoid), 360 - Math.abs(h - avoid));
+      if (allowedHue(h) && gap >= 40) return h;
+    }
+  }
+  let hue = randomAllowedHue(null);
   const theme = document.querySelector('meta[name=theme-color]');
   function paint() {
     const c = `hsl(${hue},70%,55%)`;
     document.body.style.backgroundColor = c;
     theme.setAttribute('content', c);
   }
-  function nextHue() { hue = (hue + 40 + Math.floor(Math.random() * 240)) % 360; paint(); }
+  function nextHue() { hue = randomAllowedHue(hue); paint(); }
   paint();
 
   // ----- Circles, stored in screen coordinates so zoom has no limits -----
@@ -37,7 +50,7 @@
   // nearest the screen, plus the direction to the centre", re-anchored every
   // frame, so their edges stay sharp however far you zoom in.
   const BIG = 2e6, SMALL = 1e6;
-  const circles = [];  // {cx, cy, r} or {big:true, ox, oy, nx, ny, r}
+  const circles = [];  // {cx, cy, r, color} or {big:true, ox, oy, nx, ny, r, color}
   let W = innerWidth, H = innerHeight;
   const canvas = document.getElementById('c');
   const ctx = canvas.getContext('2d');
@@ -93,10 +106,10 @@
     if (dirty) {
       dirty = false;
       ctx.clearRect(0, 0, W, H);
-      ctx.fillStyle = '#fff';
       const sx = W / 2, sy = H / 2, diag = Math.hypot(W, H);
       for (const c of circles) {
         if (c.r <= 0) continue;
+        ctx.fillStyle = c.color;
         if (!c.big) {
           const d = Math.hypot(c.cx - sx, c.cy - sy);
           if (d - c.r > diag) continue;                                     // off screen
@@ -126,7 +139,7 @@
   // ----- Press: tap for colour, hold to grow a circle -----
   let press = null; // {id, x, y, timer, circle, last, raf}
   function startCircle() {
-    const c = { cx: press.x, cy: press.y, r: 0 };
+    const c = { cx: press.x, cy: press.y, r: 0, color: WHITE };
     circles.push(c);
     press.circle = c;
     press.last = performance.now();
@@ -148,12 +161,36 @@
   function movePress(id, x, y) {
     if (press && id === press.id && !press.circle) { press.x = x; press.y = y; }
   }
+  // The top-most circle under a screen point, if any.
+  function circleAt(x, y) {
+    for (let i = circles.length - 1; i >= 0; i--) {
+      const c = circles[i];
+      if (c.r <= 0) continue;
+      const inside = c.big ? (x - c.ox) * c.nx + (y - c.oy) * c.ny >= 0
+                           : Math.hypot(x - c.cx, y - c.cy) <= c.r;
+      if (inside) return c;
+    }
+    return null;
+  }
+  // Tap on a circle: once turns it red, twice quickly turns it blue.
+  // Tap on the background: change the background colour.
+  let lastTap = null; // {circle, t}
+  function handleTap(x, y) {
+    const hit = circleAt(x, y), now = performance.now();
+    if (!hit) { lastTap = null; nextHue(); return; }
+    if (lastTap && lastTap.circle === hit && now - lastTap.t < DOUBLE_TAP_MS) {
+      hit.color = BLUE; lastTap = null;
+    } else {
+      hit.color = RED; lastTap = { circle: hit, t: now };
+    }
+    dirty = true;
+  }
   // Ends the press. A circle that was growing stops and stays on screen.
   function endPress(tap) {
     if (!press) return;
     clearTimeout(press.timer);
     cancelAnimationFrame(press.raf);
-    if (!press.circle && tap) nextHue();
+    if (!press.circle && tap) handleTap(press.x, press.y);
     press = null;
   }
 
