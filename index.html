@@ -19,8 +19,9 @@
 </head>
 <body>
 <canvas id="c"></canvas>
+<canvas id="o"></canvas>
 <div id="toast"></div>
-<div id="safe" style="position:fixed;visibility:hidden;pointer-events:none;padding-left:env(safe-area-inset-left,0px);padding-bottom:env(safe-area-inset-bottom,0px)"></div>
+<div id="safe" style="position:fixed;visibility:hidden;pointer-events:none;padding-left:env(safe-area-inset-left,0px);padding-right:env(safe-area-inset-right,0px);padding-bottom:env(safe-area-inset-bottom,0px)"></div>
 <script>
   const HOLD_MS = 500;         // how long to hold before a circle appears
   const GROW_PX_PER_S = 160;   // how fast a circle's radius grows, in screen pixels
@@ -30,6 +31,9 @@
   const LINE_COLOR = '#FFFFFF';
   const DOT_R = 10;            // the black dot in the corner, and new dots, in screen pixels
   const DOT_HIT = 28;          // how close a finger must start to the corner dot to drag it
+  const HUNTER_R = 8;          // the red dot in the other corner, and new hunters, in screen pixels
+  const HUNTER_SPEED = 25;     // hunter radii per second, so it looks the same at any zoom
+  const POP_S = 0.25;          // length of the pop animation
   const EMIT_MEAN_S = 1.2;     // average time between circles from one dot while forces are on
   const FRAME_BUDGET_MS = 12;  // physics time per frame; beyond this the simulation slows rather than freezes
 
@@ -75,16 +79,20 @@
   // circles while forces are on. wait = seconds until the next one.
   const dots = [];     // {cx, cy, r, wait} or the big form
   const emitWait = () => -Math.log(1 - Math.random()) * EMIT_MEAN_S;
-  const history = [];  // circles, lines and dots in the order they were made, for undo
+  // Red hunters dragged out of the other corner: same small/big forms as circles.
+  // Each one chases the nearest circle and pops it.
+  const hunters = [];  // {cx, cy, r} or the big form
+  const pops = [];     // {x, y, r, color, t0}: pop animations, in screen coordinates
+  const history = [];  // circles, lines, dots and hunters in the order they were made, for undo
   function undoLast() {
     while (history.length) {
       const item = history.pop();
-      const list = item.type === 'circle' ? circles : item.type === 'dot' ? dots : strokes;
+      const list = { circle: circles, dot: dots, hunter: hunters, line: strokes }[item.type];
       const i = list.indexOf(item.obj);
       if (i < 0) continue;
       list.splice(i, 1);
       dirty = true;
-      toast(item.type === 'circle' ? 'Removed circle' : item.type === 'dot' ? 'Removed dot' : 'Removed line');
+      toast({ circle: 'Removed circle', dot: 'Removed dot', hunter: 'Removed hunter', line: 'Removed line' }[item.type]);
       if (navigator.vibrate) navigator.vibrate(10);
       return;
     }
@@ -130,18 +138,23 @@
   }
   let W = innerWidth, H = innerHeight;
   const canvas = document.getElementById('c');
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d'), mainCtx = ctx;
   // The corner dot sits 32px in from the bottom-left, clear of any notch or home bar.
   const safeProbe = document.getElementById('safe');
-  let dockX = 32, dockY = H - 32;
+  let dockX = 32, dockY = H - 32, redX = W - 32, redY = H - 32;
+  const overlay = document.getElementById('o');   // flashing red dots and pops, redrawn every frame
+  const octx = overlay.getContext('2d');
   function resize() {
     W = innerWidth; H = innerHeight;
     const cs = getComputedStyle(safeProbe);
     dockX = 32 + (parseFloat(cs.paddingLeft) || 0);
     dockY = H - 32 - (parseFloat(cs.paddingBottom) || 0);
+    redX = W - 32 - (parseFloat(cs.paddingRight) || 0); redY = dockY;
     const d = devicePixelRatio || 1;
     canvas.width = Math.round(W * d); canvas.height = Math.round(H * d);
     ctx.setTransform(d, 0, 0, d, 0, 0);
+    overlay.width = canvas.width; overlay.height = canvas.height;
+    octx.setTransform(d, 0, 0, d, 0, 0);
     dirty = true;
   }
 
@@ -150,7 +163,7 @@
   function transformAll(k, px, py, dx, dy, a = 0) {
     const cos = Math.cos(a) * k, sin = Math.sin(a) * k;
     const cs = Math.cos(a), sn = Math.sin(a);
-    for (const c of circles.concat(dots)) {
+    for (const c of circles.concat(dots, hunters)) {
       if (c.big) {
         const x = c.ox - px, y = c.oy - py;
         c.ox = px + x * cos - y * sin + dx; c.oy = py + x * sin + y * cos + dy;
@@ -179,7 +192,7 @@
 
   function normalise() {
     const sx = W / 2, sy = H / 2;
-    for (const c of circles.concat(dots)) {
+    for (const c of circles.concat(dots, hunters)) {
       if (!c.big && c.r > BIG) {
         let dx = sx - c.cx, dy = sy - c.cy, L = Math.hypot(dx, dy);
         if (L === 0) { dx = 1; dy = 0; L = 1; }
@@ -362,7 +375,7 @@
   }
 
   // Fill a circle (small or big form), skipping it if it's off screen.
-  function fillDisc(c) {
+  function fillDisc(c, ctx = mainCtx) {
     const sx = W / 2, sy = H / 2, diag = Math.hypot(W, H);
     if (!c.big) {
       const d = Math.hypot(c.cx - sx, c.cy - sy);
@@ -474,6 +487,78 @@
     dirty = true;
   }
 
+  // ----- Hunters: each frame, head straight for the nearest circle; touching pops it -----
+  function huntStep(dt, now) {
+    if (!hunters.length) return;
+    const held = press && press.circle;
+    let popped = null;
+    for (const h of hunters) {
+      if (h.big || !(h.r > 0) || !isFinite(h.cx) || !isFinite(h.cy)) continue;  // huge hunters wait until zoomed out
+      let step = HUNTER_SPEED * h.r * dt;
+      // Up to a few pops per frame if circles are packed tight; each move is a
+      // straight line to the target's edge, so a fast hunter can't skip past it.
+      for (let k = 0; k < 4 && step > 0; k++) {
+        let best = null, bestGap = Infinity, bx = 0, by = 0;
+        for (const c of circles) {
+          if (c === held || !(c.r > 0) || (popped && popped.has(c))) continue;
+          let gap, ux, uy;
+          if (!c.big) {
+            const dx = c.cx - h.cx, dy = c.cy - h.cy;
+            if (Math.abs(dx) - c.r - h.r > bestGap || Math.abs(dy) - c.r - h.r > bestGap) continue;
+            const d = Math.sqrt(dx * dx + dy * dy);
+            gap = d - c.r - h.r; ux = d > 0 ? dx / d : 0; uy = d > 0 ? dy / d : 0;
+          } else {
+            gap = -((h.cx - c.ox) * c.nx + (h.cy - c.oy) * c.ny) - h.r;   // distance to a huge circle's edge
+            ux = c.nx; uy = c.ny;
+          }
+          if (gap < bestGap) { bestGap = gap; best = c; bx = ux; by = uy; }
+        }
+        if (!best) break;
+        if (bestGap > step) { h.cx += bx * step; h.cy += by * step; break; }
+        const go = Math.max(0, bestGap);
+        h.cx += bx * go; h.cy += by * go; step -= go;
+        (popped || (popped = new Set())).add(best);
+        if (!best.big) pops.push({ x: best.cx, y: best.cy, r: best.r, color: best.color, t0: now });
+      }
+    }
+    if (!popped) return;
+    let w = 0;
+    for (const c of circles) if (!popped.has(c)) circles[w++] = c;
+    circles.length = w;
+    w = 0;
+    for (const it of history) if (!(it.type === 'circle' && popped.has(it.obj))) history[w++] = it;
+    history.length = w;
+    dirty = true;
+    if (navigator.vibrate) navigator.vibrate(8);
+  }
+  // A red dot with a thin light ring, pulsing about twice a second.
+  function drawHunter(c, now) {
+    const a = 0.3 + 0.7 * (0.5 + 0.5 * Math.cos(now / 1000 * Math.PI * 4));
+    octx.globalAlpha = a;
+    octx.fillStyle = '#ff2a2a';
+    if (fillDisc(c, octx) && c.r < 1e5) {
+      octx.lineWidth = Math.min(2, c.r * 0.25); octx.strokeStyle = 'rgba(255,255,255,.9)';
+      octx.beginPath(); octx.arc(c.cx, c.cy, c.r, 0, Math.PI * 2); octx.stroke();
+    }
+    octx.globalAlpha = 1;
+  }
+  function drawOverlay(now) {
+    octx.clearRect(0, 0, W, H);
+    for (let i = pops.length - 1; i >= 0; i--) {
+      const p = pops[i], t = Math.max(0, (now - p.t0) / 1000 / POP_S);
+      if (t >= 1) { pops.splice(i, 1); continue; }
+      const diag = Math.hypot(W, H);
+      if (Math.hypot(p.x - W / 2, p.y - H / 2) - p.r * 1.6 > diag || p.r > 4 * diag) continue;  // off screen / too big to see
+      octx.globalAlpha = 1 - t;
+      octx.strokeStyle = p.color; octx.lineWidth = Math.max(2, Math.min(12, p.r * 0.25)) * (1 - t);
+      octx.beginPath(); octx.arc(p.x, p.y, p.r * (1 + 0.6 * t), 0, Math.PI * 2); octx.stroke();
+    }
+    octx.globalAlpha = 1;
+    for (const h of hunters) if (h.r > 0) drawHunter(h, now);
+    drawHunter({ cx: redX, cy: redY, r: HUNTER_R }, now);                  // the red corner dot
+    if (dotDrag && dotDrag.kind === 'hunter') drawHunter({ cx: dotDrag.x, cy: dotDrag.y, r: HUNTER_R }, now);
+  }
+
   let dirty = true;
   function draw(now) {
     now = now || performance.now();
@@ -496,6 +581,7 @@
       dirty = true;
     }
     eatStep();
+    if (dt > 0) huntStep(dt, now);
     if (dirty) {
       dirty = false;
       ctx.clearRect(0, 0, W, H);
@@ -534,8 +620,9 @@
       }
       for (const d of dots) if (d.r > 0) drawDot(d);
       drawDot({ cx: dockX, cy: dockY, r: DOT_R });                         // the corner dot
-      if (dotDrag) drawDot({ cx: dotDrag.x, cy: dotDrag.y, r: DOT_R });    // a dot being dragged out
+      if (dotDrag && dotDrag.kind === 'dot') drawDot({ cx: dotDrag.x, cy: dotDrag.y, r: DOT_R });  // a dot being dragged out
     }
+    drawOverlay(now);
     requestAnimationFrame(draw);
   }
   // Liang–Barsky: the part of segment (ax,ay)-(bx,by) inside a rectangle, or null.
@@ -553,21 +640,29 @@
   resize();
   requestAnimationFrame(draw);
 
-  // ----- Corner dot: drag from it to place a new dot -----
-  let dotDrag = null; // {id, x, y}
-  const onDock = (x, y) => Math.hypot(x - dockX, y - dockY) <= DOT_HIT;
-  function beginDot(id, x, y) { dotDrag = { id, x, y }; dirty = true; }
+  // ----- Corner dots: drag from the black one to place a dot, from the red one to place a hunter -----
+  let dotDrag = null; // {id, x, y, kind: 'dot' | 'hunter'}
+  const dockAt = (x, y) => Math.hypot(x - dockX, y - dockY) <= DOT_HIT ? 'dot'
+                         : Math.hypot(x - redX, y - redY) <= DOT_HIT ? 'hunter' : null;
+  const onDock = (x, y) => dockAt(x, y) != null;
+  function beginDot(id, x, y) { dotDrag = { id, x, y, kind: dockAt(x, y) }; dirty = true; }
   function moveDot(id, x, y) {
     if (!dotDrag || dotDrag.id !== id) return;
     dotDrag.x = x; dotDrag.y = y; dirty = true;
   }
   function endDot(place) {
     if (!dotDrag) return;
-    const { x, y } = dotDrag; dotDrag = null; dirty = true;
-    if (!place || onDock(x, y) || x < 0 || y < 0 || x > W || y > H) return;  // dropped back on the corner: cancel
-    const d = { cx: x, cy: y, r: DOT_R, wait: emitWait() };
-    dots.push(d);
-    history.push({ type: 'dot', obj: d });
+    const { x, y, kind } = dotDrag; dotDrag = null; dirty = true;
+    if (!place || onDock(x, y) || x < 0 || y < 0 || x > W || y > H) return;  // dropped back on a corner: cancel
+    if (kind === 'hunter') {
+      const h = { cx: x, cy: y, r: HUNTER_R };
+      hunters.push(h);
+      history.push({ type: 'hunter', obj: h });
+    } else {
+      const d = { cx: x, cy: y, r: DOT_R, wait: emitWait() };
+      dots.push(d);
+      history.push({ type: 'dot', obj: d });
+    }
     if (navigator.vibrate) navigator.vibrate(15);
   }
 
@@ -785,7 +880,8 @@
   document.addEventListener('contextmenu', (e) => e.preventDefault());
 
   // For testing: window.__hue exposes state.
-  window.__hue = { circles, strokes, dots, history, transformAll, get dock() { return { x: dockX, y: dockY, r: DOT_R }; }, get hue() { return hue; }, set hue(h) { hue = h; paint(); }, get forcesOn() { return forcesOn; } };
+  window.__hue = { circles, strokes, dots, hunters, pops, history, transformAll, get dock() { return { x: dockX, y: dockY, r: DOT_R }; },
+    get redDock() { return { x: redX, y: redY, r: HUNTER_R }; }, get hue() { return hue; }, set hue(h) { hue = h; paint(); }, get forcesOn() { return forcesOn; } };
 </script>
 </body>
 </html>
