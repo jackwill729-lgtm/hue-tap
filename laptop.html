@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Hue Tap (laptop)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<script>
+  // Laptop version: the same game with cursor steering. Keeps any other query (e.g. ?v=28).
+  var q = new URLSearchParams(location.search); q.set('mode', 'laptop');
+  location.replace('./?' + q.toString() + location.hash);
+</script>
+</head>
+<body style="background:#222;color:#fff;font:16px system-ui,sans-serif">
+<p><a href="./?mode=laptop" style="color:#fff">Open Hue Tap (laptop)</a></p>
+</body>
+</html>

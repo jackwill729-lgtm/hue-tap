@@ -21,6 +21,9 @@
     font:600 16px/1.4 -apple-system,system-ui,sans-serif;background:rgba(0,0,0,.5);padding:22px 30px;border-radius:22px;display:none}
   #over b{display:block;font-size:30px;margin-bottom:6px}
   #over small{display:block;margin-top:10px;font-size:14px;opacity:.85}
+  #hint{position:fixed;left:50%;bottom:calc(68px + env(safe-area-inset-bottom));transform:translateX(-50%);max-width:calc(100% - 140px);
+    text-align:center;font:500 13px/1.45 -apple-system,system-ui,sans-serif;color:#fff;background:rgba(0,0,0,.35);padding:8px 14px;
+    border-radius:16px;opacity:0;transition:opacity .5s;pointer-events:none;width:max-content}
 </style>
 </head>
 <body>
@@ -28,6 +31,7 @@
 <canvas id="o"></canvas>
 <div id="toast"></div>
 <div id="score"></div>
+<div id="hint">Move cursor to steer · click colour · hold circle · drag line · scroll zoom · F forces · Ctrl+Z undo · R reset · H help</div>
 <div id="over"><b>Game over</b><span id="overScore"></span><small>Tap to play again</small></div>
 <div id="safe" style="position:fixed;visibility:hidden;pointer-events:none;padding-left:env(safe-area-inset-left,0px);padding-right:env(safe-area-inset-right,0px);padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)"></div>
 <script>
@@ -931,6 +935,17 @@
   }
   function drawOverlay(now) {
     octx.clearRect(0, 0, W, H);
+    if (laptop && cursor && steering > 0 && playerLive() && player.r < Math.min(W, H) / 4) {   // faint arrow towards the cursor
+      const ex = cursor.x - W / 2, ey = cursor.y - H / 2, m = Math.hypot(ex, ey), ux = ex / m, uy = ey / m;
+      const a = player.r + 6, b = Math.min(m - 4, a + 18 + 40 * Math.min(1, steering / (TILT_MAX_RADII * PLAYER_R * player.scale)));
+      if (b > a + 4) {
+        octx.globalAlpha = 0.35; octx.strokeStyle = '#FFFFFF'; octx.lineWidth = 2; octx.lineCap = 'round';
+        const x0 = W / 2 + ux * a, y0 = H / 2 + uy * a, x1 = W / 2 + ux * b, y1 = H / 2 + uy * b;
+        octx.beginPath(); octx.moveTo(x0, y0); octx.lineTo(x1, y1);
+        octx.moveTo(x1 - ux * 7 - uy * 5, y1 - uy * 7 + ux * 5); octx.lineTo(x1, y1); octx.lineTo(x1 - ux * 7 + uy * 5, y1 - uy * 7 - ux * 5);
+        octx.stroke(); octx.globalAlpha = 1;
+      }
+    }
     for (let i = pops.length - 1; i >= 0; i--) {
       const p = pops[i], t = Math.max(0, (now - p.t0) / 1000 / POP_S);
       if (t >= 1) { pops.splice(i, 1); continue; }
@@ -956,6 +971,16 @@
   // averaged into the neutral pose; until then the player stays put.
   let neutral = null, calib = null, tiltX = 0, tiltY = 0;   // tilt from neutral in screen axes, degrees
   const keys = new Set();
+  // Laptop mode: the cursor steers instead of tilt. ?mode=laptop / ?mode=phone force
+  // it; otherwise it's on for a fine pointer with no touch at all.
+  const MODE_Q = new URLSearchParams(location.search).get('mode');
+  const laptop = MODE_Q === 'laptop' || (MODE_Q !== 'phone' && matchMedia('(pointer: fine)').matches &&
+                 !('ontouchstart' in window) && navigator.maxTouchPoints === 0);
+  const CURSOR_DEAD = 2;       // no steering within this many player radii of the centre
+  const CURSOR_FULL = 0.35;    // full speed at this fraction of min(W, H) from the centre
+  let cursor = null;           // {x, y} while the mouse is over the window
+  let mouseHeld = false;       // a mouse button is down: steering pauses (drawing, growing, dragging)
+  let steering = 0;            // cursor speed asked for this frame, px/s (for the hint arrow)
   const wrap180 = (d) => ((d % 360) + 540) % 360 - 180;
   function onTilt(beta, gamma) {
     if (beta == null || gamma == null || !isFinite(beta) || !isFinite(gamma)) return;   // no sensor
@@ -998,6 +1023,15 @@
         const sp = MAX * Math.min(1, (m - TILT_DEAD) / (TILT_FULL - TILT_DEAD));
         vx = tiltX / m * sp; vy = tiltY / m * sp;
       }
+      if (laptop && cursor && !mouseHeld) {
+        const ex = cursor.x - W / 2, ey = cursor.y - H / 2, m = Math.hypot(ex, ey);
+        const dead = CURSOR_DEAD * Math.max(player.r, 0), full = Math.max(dead + 1, CURSOR_FULL * Math.min(W, H));
+        if (m > dead) {
+          const sp = MAX * Math.min(1, (m - dead) / (full - dead));
+          vx += ex / m * sp; vy += ey / m * sp;
+        }
+      }
+      steering = Math.hypot(vx, vy);
       const kx = (keys.has('right') ? 1 : 0) - (keys.has('left') ? 1 : 0), ky = (keys.has('down') ? 1 : 0) - (keys.has('up') ? 1 : 0);
       if (kx || ky) { const L = Math.hypot(kx, ky); vx += kx / L * MAX; vy += ky / L * MAX; }
       const v = Math.hypot(vx, vy);
@@ -1496,17 +1530,24 @@
   const isMouse = (e) => e.pointerType !== 'touch';
   document.addEventListener('pointerdown', (e) => {
     if (!isMouse(e)) return;
+    mouseHeld = true; cursor = { x: e.clientX, y: e.clientY };
     if (playerOn && player.over) { restartTap = 'm'; tapRun = null; return; }
     if (onDock(e.clientX, e.clientY)) { tapRun = null; beginDot('m', e.clientX, e.clientY); } else beginPress('m', e.clientX, e.clientY);
   });
-  document.addEventListener('pointermove', (e) => { if (isMouse(e)) { movePress('m', e.clientX, e.clientY); moveDot('m', e.clientX, e.clientY); } });
+  document.addEventListener('pointermove', (e) => { if (isMouse(e)) {
+    cursor = e.clientX >= 0 && e.clientY >= 0 && e.clientX <= W && e.clientY <= H ? { x: e.clientX, y: e.clientY } : null; movePress('m', e.clientX, e.clientY); moveDot('m', e.clientX, e.clientY); } });
   document.addEventListener('pointerup', (e) => {
     if (!isMouse(e)) return;
+    mouseHeld = false;
     askTiltPermission();
     if (restartTap === 'm') { restartTap = null; if (player.over) restart(); return; }
     endPress(true); endDot(true);
   });
-  document.addEventListener('pointercancel', (e) => { if (isMouse(e)) { endPress(false); endDot(false); } });
+  document.addEventListener('pointercancel', (e) => { if (isMouse(e)) { mouseHeld = false; endPress(false); endDot(false); } });
+  // The cursor leaving the window or the window losing focus stops the steering.
+  document.documentElement.addEventListener('mouseleave', () => { cursor = null; });
+  addEventListener('mouseout', (e) => { if (!e.relatedTarget) cursor = null; });
+  addEventListener('blur', () => { cursor = null; mouseHeld = false; });
   document.addEventListener('wheel', (e) => {
     e.preventDefault();
     const px = playerOn ? W / 2 : e.clientX, py = playerOn ? H / 2 : e.clientY;
@@ -1519,11 +1560,29 @@
                     A: 'left', D: 'right', W: 'up', S: 'down' };
   addEventListener('keydown', (e) => {
     const k = KEY_DIR[e.key];
-    if (k) { keys.add(k); e.preventDefault(); }
+    const mod = e.ctrlKey || e.metaKey;
+    if (k && !mod) { keys.add(k); e.preventDefault(); }
     else if ((e.key === 'Enter' || e.key === ' ') && playerOn && player.over) { restart(); e.preventDefault(); }
+    // Keyboard versions of the touch gestures (handy on a laptop, harmless elsewhere).
+    else if ((mod && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) || (e.key === 'Backspace' && !mod)) { undoLast(); e.preventDefault(); }
+    else if (mod || e.altKey || e.repeat) return;
+    else if (e.key === 'f' || e.key === 'F') { toggleForces(); e.preventDefault(); }
+    else if (e.key === 'r' || e.key === 'R') { tapRun = null; resetGame(); e.preventDefault(); }
+    else if (e.key === 'h' || e.key === 'H' || e.key === '?') { showHint(!hintOn, false); e.preventDefault(); }
   });
   addEventListener('keyup', (e) => { const k = KEY_DIR[e.key]; if (k) keys.delete(k); });
   addEventListener('blur', () => keys.clear());
+  // Laptop help hint: shown for 6 s on load, H or ? toggles it.
+  const hintEl = document.getElementById('hint');
+  let hintOn = false, hintTimer = null;
+  function showHint(on, auto) {
+    hintOn = on; hintEl.style.opacity = on ? '1' : '0'; clearTimeout(hintTimer);
+    if (on && auto) hintTimer = setTimeout(() => showHint(false, false), 6000);
+  }
+  if (laptop) {
+    showHint(true, true);
+    document.querySelector('#over small').textContent = 'Click or press Space to play again';
+  }
 
   // For testing: window.__hue exposes state.
   window.__hue = { circles, strokes, dots, hunters, chasers, spawners, pops, history, transformAll,
@@ -1534,7 +1593,8 @@
     get player() { return { x: W / 2, y: H / 2, r: player.r, eaten: player.eaten, score: player.score, caught: player.caught, size: player.size, gameOver: player.over,
       invulnerable: invulnerable(performance.now()), huntSafe: huntSafe(performance.now()), guard: player.guard, scale: player.scale, vx: player.vx, vy: player.vy,
       tilt: [tiltX, tiltY], neutral: neutral && [neutral.beta, neutral.gamma], on: playerOn }; },
-    emitStats, resetGame, spawnWait, SPAWNER_MEAN_S,
+    emitStats, resetGame, spawnWait, SPAWNER_MEAN_S, laptop, get cursor() { return cursor; }, get mouseHeld() { return mouseHeld; },
+    get steering() { return steering; }, get hintOn() { return hintOn; },
     playerObj: player, setTilt: onTilt, restart,
     get playerOn() { return playerOn; }, set playerOn(v) { playerOn = !!v; dirty = true; overEl.style.display = playerOn && player.over ? 'block' : 'none'; } };
 </script>
