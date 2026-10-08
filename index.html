@@ -48,10 +48,10 @@
   const CLONE_EVERY = 20;      // a hunter clones itself every this many pops
   const EMIT_MEAN_S = 1.2;     // average time between circles from one dot while forces are on
   const FRAME_BUDGET_MS = 12;  // physics time per frame; beyond this the simulation slows rather than freezes
-  const SPAWN_HUNTER = 0.1;    // chance a black dot's emission is a hunter instead of a circle
-  const SPAWN_CHASER = 0.1;    // ... or a chaser
+  const SPAWNER_R = 10;        // red / blue spawners dragged from the corners, in screen pixels
+  const SPAWNER_MEAN_S = 3;    // average time between hunters / chasers from one spawner while forces are on
   const EMIT_MIN = 0.6, EMIT_MAX = 1.6;   // emitted circles: this range times the dot's radius
-  const SPAWN_R = 0.8;         // spawned hunters and chasers: this fraction of the dot's radius
+  const SPAWN_R = 0.8;         // spawned hunters and chasers: this fraction of the spawner's radius
   const CIRCLE_FLEE_ACCEL = 15;  // coloured circles run from hunters: hunter radii/s² at point-blank range
   const PLAYER_R = 12;         // the white player dot's starting radius, in screen pixels
   const TILT_DEAD = 3;         // degrees of tilt that do nothing
@@ -103,7 +103,11 @@
   // circles while forces are on. wait = seconds until the next one.
   const dots = [];     // {cx, cy, r, wait} or the big form
   const emitWait = () => -Math.log(1 - Math.random()) * EMIT_MEAN_S;
-  const emitStats = { circle: 0, hunter: 0, chaser: 0 };   // what the dots have emitted (for tests)
+  const emitStats = { circle: 0, hunter: 0, chaser: 0 };   // what dots and spawners have released (for tests)
+  // Red and blue spawners dragged out of those corners: static like black dots
+  // (same small/big forms), releasing hunters (red) or chasers (blue) while forces are on.
+  const spawners = [];  // {cx, cy, r, kind: 'hunter' | 'chaser', wait} or the big form
+  const spawnWait = () => -Math.log(1 - Math.random()) * SPAWNER_MEAN_S;
   // Red hunters dragged out of the other corner: same small/big forms as circles.
   // Each one chases the nearest circle and pops it.
   const hunters = [];  // {cx, cy, r} or the big form
@@ -124,12 +128,14 @@
   function undoLast() {
     while (history.length) {
       const item = history.pop();
-      const list = { circle: circles, dot: dots, hunter: hunters, chaser: chasers, line: strokes }[item.type];
+      const list = { circle: circles, dot: dots, hunter: hunters, chaser: chasers, line: strokes,
+                     hunterSpawner: spawners, chaserSpawner: spawners }[item.type];
       const i = list.indexOf(item.obj);
       if (i < 0) continue;
       list.splice(i, 1);
       dirty = true;
-      toast({ circle: 'Removed circle', dot: 'Removed dot', hunter: 'Removed hunter', chaser: 'Removed chaser', line: 'Removed line' }[item.type]);
+      toast({ circle: 'Removed circle', dot: 'Removed dot', hunter: 'Removed hunter', chaser: 'Removed chaser', line: 'Removed line',
+              hunterSpawner: 'Removed hunter spawner', chaserSpawner: 'Removed chaser spawner' }[item.type]);
       if (navigator.vibrate) navigator.vibrate(10);
       return;
     }
@@ -201,7 +207,7 @@
   function transformAll(k, px, py, dx, dy, a = 0) {
     const cos = Math.cos(a) * k, sin = Math.sin(a) * k;
     const cs = Math.cos(a), sn = Math.sin(a);
-    for (const c of circles.concat(dots, hunters, chasers)) {
+    for (const c of circles.concat(dots, hunters, chasers, spawners)) {
       if (c.big) {
         const x = c.ox - px, y = c.oy - py;
         c.ox = px + x * cos - y * sin + dx; c.oy = py + x * sin + y * cos + dy;
@@ -231,7 +237,7 @@
 
   function normalise() {
     const sx = W / 2, sy = H / 2;
-    for (const c of circles.concat(dots, hunters, chasers)) {
+    for (const c of circles.concat(dots, hunters, chasers, spawners)) {
       if (!c.big && c.r > BIG) {
         let dx = sx - c.cx, dy = sy - c.cy, L = Math.hypot(dx, dy);
         if (L === 0) { dx = 1; dy = 0; L = 1; }
@@ -471,18 +477,6 @@
       d.wait = emitWait();
       const ok = d.big ? isFinite(d.ox) && isFinite(d.oy) : isFinite(d.cx) && isFinite(d.cy);
       if (!ok || !isFinite(d.r)) continue;          // only if the view itself has overflowed
-      const roll = Math.random();
-      if (roll < SPAWN_HUNTER + SPAWN_CHASER) {
-        // Now and then a hunter or chaser instead, 0.8x the dot's size, at the dot.
-        const kind = roll < SPAWN_HUNTER ? 'hunter' : 'chaser', r = d.r * SPAWN_R;
-        const o = d.big
-          ? { big: true, ox: d.ox + d.nx * (d.r - r), oy: d.oy + d.ny * (d.r - r), nx: d.nx, ny: d.ny, r }   // same centre as the dot
-          : { cx: d.cx, cy: d.cy, r };
-        if (kind === 'hunter') { o.popCount = 0; hunters.push(o); } else chasers.push(o);
-        history.push({ type: kind, obj: o });
-        emitStats[kind]++;
-        continue;
-      }
       emitStats.circle++;
       const h = Math.floor(Math.random() * 360);   // any hue, the background's included
       const a = Math.random() * Math.PI * 2, v = d.r * (1.5 + Math.random() * 2);
@@ -493,6 +487,22 @@
       c.hue = h; c.color = hsl(h); c.vx = Math.cos(a) * v; c.vy = Math.sin(a) * v;
       circles.push(c);
       history.push({ type: 'circle', obj: c });
+    }
+    // Spawners: same rule, slower (hunters also clone themselves), releasing a
+    // hunter or chaser 0.8x the spawner's size just off its centre.
+    for (const sp of spawners) {
+      sp.wait -= dt;
+      if (sp.wait > 0) continue;
+      sp.wait = spawnWait();
+      const ok = sp.big ? isFinite(sp.ox) && isFinite(sp.oy) : isFinite(sp.cx) && isFinite(sp.cy);
+      if (!ok || !isFinite(sp.r)) continue;
+      const r = sp.r * SPAWN_R, a = Math.random() * Math.PI * 2, off = sp.r * 0.3 * Math.random();
+      const o = sp.big
+        ? { big: true, ox: sp.ox + sp.nx * (sp.r - r), oy: sp.oy + sp.ny * (sp.r - r), nx: sp.nx, ny: sp.ny, r }   // huge: same centre
+        : { cx: sp.cx + Math.cos(a) * off, cy: sp.cy + Math.sin(a) * off, r };
+      if (sp.kind === 'hunter') { o.popCount = 0; hunters.push(o); } else chasers.push(o);
+      history.push({ type: sp.kind, obj: o });
+      emitStats[sp.kind]++;
     }
   }
 
@@ -908,6 +918,17 @@
     }
     octx.globalAlpha = 1;
   }
+  // A spawner: its corner's colour, steady (never flashing), with a thick white
+  // ring and a dark centre, so it doesn't look like the hunters it releases.
+  function drawSpawner(c, color) {
+    octx.fillStyle = color;
+    if (fillDisc(c, octx) && c.r < 1e5) {
+      octx.lineWidth = Math.min(3, c.r * 0.3); octx.strokeStyle = '#FFFFFF';
+      octx.beginPath(); octx.arc(c.cx, c.cy, c.r, 0, Math.PI * 2); octx.stroke();
+      octx.fillStyle = 'rgba(0,0,0,.6)';
+      octx.beginPath(); octx.arc(c.cx, c.cy, c.r * 0.38, 0, Math.PI * 2); octx.fill();
+    }
+  }
   function drawOverlay(now) {
     octx.clearRect(0, 0, W, H);
     for (let i = pops.length - 1; i >= 0; i--) {
@@ -920,14 +941,15 @@
       octx.beginPath(); octx.arc(p.x, p.y, p.r * (1 + 0.6 * t), 0, Math.PI * 2); octx.stroke();
     }
     octx.globalAlpha = 1;
+    for (const sp of spawners) if (sp.r > 0) drawSpawner(sp, sp.kind === 'hunter' ? RED : BLUE);   // under what they release
     for (const h of hunters) if (h.r > 0) drawHunter(h, now);
     drawHunter({ cx: redX, cy: redY, r: HUNTER_R }, now);                  // the red corner dot
-    if (dotDrag && dotDrag.kind === 'hunter') drawHunter({ cx: dotDrag.x, cy: dotDrag.y, r: HUNTER_R }, now);
+    if (dotDrag && dotDrag.kind === 'hunter') drawSpawner({ cx: dotDrag.x, cy: dotDrag.y, r: SPAWNER_R }, RED);
     for (const c of chasers) if (c.r > 0) drawHunter(c, now, BLUE);
     drawHunter({ cx: blueX, cy: blueY, r: CHASER_R }, now, BLUE);         // the blue corner dot
-    if (dotDrag && dotDrag.kind === 'chaser') drawHunter({ cx: dotDrag.x, cy: dotDrag.y, r: CHASER_R }, now, BLUE);
+    if (dotDrag && dotDrag.kind === 'chaser') drawSpawner({ cx: dotDrag.x, cy: dotDrag.y, r: SPAWNER_R }, BLUE);
   }
-  const BLUE = '#2a7bff';
+  const BLUE = '#2a7bff', RED = '#ff2a2a';
 
   // ----- Player -----
   // Tilt: the readings in the first 0.3 s after load (and after each restart) are
@@ -1229,14 +1251,10 @@
     if (!dotDrag) return;
     const { x, y, kind } = dotDrag; dotDrag = null; dirty = true;
     if (!place || onDock(x, y) || x < 0 || y < 0 || x > W || y > H) return;  // dropped back on a corner: cancel
-    if (kind === 'chaser') {
-      const c = { cx: x, cy: y, r: CHASER_R };
-      chasers.push(c);
-      history.push({ type: 'chaser', obj: c });
-    } else if (kind === 'hunter') {
-      const h = { cx: x, cy: y, r: HUNTER_R, popCount: 0 };
-      hunters.push(h);
-      history.push({ type: 'hunter', obj: h });
+    if (kind === 'chaser' || kind === 'hunter') {
+      const sp = { cx: x, cy: y, r: SPAWNER_R, kind, wait: spawnWait() };
+      spawners.push(sp);
+      history.push({ type: kind + 'Spawner', obj: sp });
     } else {
       const d = { cx: x, cy: y, r: DOT_R, wait: emitWait() };
       dots.push(d);
@@ -1482,7 +1500,10 @@
   addEventListener('blur', () => keys.clear());
 
   // For testing: window.__hue exposes state.
-  window.__hue = { circles, strokes, dots, hunters, chasers, pops, history, transformAll, get dock() { return { x: dockX, y: dockY, r: DOT_R }; },
+  window.__hue = { circles, strokes, dots, hunters, chasers, spawners, pops, history, transformAll,
+    // test hooks: add a hunter / chaser directly (the corners now place spawners)
+    addHunter(x, y, r = HUNTER_R) { const h = { cx: x, cy: y, r, popCount: 0 }; hunters.push(h); history.push({ type: 'hunter', obj: h }); return h; },
+    addChaser(x, y, r = CHASER_R) { const c = { cx: x, cy: y, r }; chasers.push(c); history.push({ type: 'chaser', obj: c }); return c; }, get dock() { return { x: dockX, y: dockY, r: DOT_R }; },
     get redDock() { return { x: redX, y: redY, r: HUNTER_R }; }, get blueDock() { return { x: blueX, y: blueY, r: CHASER_R }; }, get hue() { return hue; }, set hue(h) { hue = h; paint(); }, get forcesOn() { return forcesOn; },
     get player() { return { x: W / 2, y: H / 2, r: player.r, eaten: player.eaten, score: player.score, caught: player.caught, size: player.size, gameOver: player.over,
       invulnerable: invulnerable(performance.now()), huntSafe: huntSafe(performance.now()), guard: player.guard, scale: player.scale, vx: player.vx, vy: player.vy,
