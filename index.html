@@ -393,6 +393,87 @@
     }
   }
 
+  // ----- Eating: a bigger circle covering more than half of a smaller one
+  // removes it and clones itself (same size, colour and velocity), just
+  // touching it on the side facing the circle it ate.
+  const eatList = [];
+  const clamp1 = (x) => x < -1 ? -1 : x > 1 ? 1 : x;
+  // Fraction of the small disc (radius r) inside the big one (R > r), for
+  // R - r < d < R. Worked out scale-free so tiny or huge sizes stay exact.
+  function lensFrac(R, r, d) {
+    if (r < 1e-6 * R) return d < R ? 1 : 0;          // big edge is straight at this scale
+    r /= R; d /= R;
+    const a1 = Math.acos(clamp1((d * d + r * r - 1) / (2 * d * r)));
+    const a2 = Math.acos(clamp1((d * d + 1 - r * r) / (2 * d)));
+    const tri = 0.5 * Math.sqrt(Math.max(0, (-d + r + 1) * (d + r - 1) * (d - r + 1) * (d + r + 1)));
+    return (r * r * a1 + a2 - tri) / (Math.PI * r * r);
+  }
+  function cloneOf(p, extra) {
+    const c = Object.assign({ r: p.r, color: p.color, vx: p.vx || 0, vy: p.vy || 0 }, extra);
+    if (p.hue != null) c.hue = p.hue;
+    return c;
+  }
+  function eatStep() {
+    if (circles.length < 2) return;
+    const held = press && press.circle;   // a circle still growing under a finger sits this out
+    let eaten = null;                     // Set, made only when something is eaten
+    const ate = new Set(), clones = [];
+    const eat = (big, small, clone) => {
+      (eaten || (eaten = new Set())).add(small); ate.add(big); clones.push(clone);
+    };
+    // Ordinary circles: sweep along x so only nearby pairs are looked at.
+    eatList.length = 0;
+    for (const c of circles) if (!c.big && c.r > 0 && c !== held) { c.lx = c.cx - c.r; eatList.push(c); }
+    eatList.sort((p, q) => p.lx - q.lx);
+    const n = eatList.length;
+    for (let i = 0; i < n; i++) {
+      const a = eatList[i], right = a.cx + a.r;
+      if (eaten && eaten.has(a)) continue;
+      for (let j = i + 1; j < n; j++) {
+        const b = eatList[j];
+        if (b.lx > right) break;
+        if (eaten && eaten.has(b)) continue;
+        let big = a, sm = b; if (b.r > a.r) { big = b; sm = a; }
+        if (!(big.r > sm.r * (1 + 1e-9)) || ate.has(big)) continue;   // equal sizes never eat
+        const R = big.r, dx = sm.cx - big.cx, dy = sm.cy - big.cy;
+        // A small circle whose centre is outside the big one is never more than half covered.
+        if (Math.abs(dx) >= R || Math.abs(dy) >= R) continue;
+        const d2 = dx * dx + dy * dy;
+        if (d2 >= R * R) continue;
+        const d = Math.sqrt(d2);
+        if (d + sm.r > R && lensFrac(R, sm.r, d) <= 0.5) continue;
+        let ux, uy;
+        if (d > 0) { ux = dx / d; uy = dy / d; } else { const t = Math.random() * Math.PI * 2; ux = Math.cos(t); uy = Math.sin(t); }
+        eat(big, sm, cloneOf(big, { cx: big.cx + ux * 2 * R, cy: big.cy + uy * 2 * R }));
+        if (sm === a) break;                // a is gone: stop checking it
+      }
+    }
+    // Huge circles: at that size the edge is a straight line on screen, so a smaller
+    // circle is more than half inside when its centre is on the inner side. The
+    // clone is the mirror image: a huge circle touching the parent at the point
+    // nearest the eaten circle, filling the other side of that line.
+    for (const B of circles) {
+      if (!B.big || B === held || ate.has(B) || !(B.r > 0)) continue;
+      for (const c of eatList) {
+        if ((eaten && eaten.has(c)) || !(B.r > c.r * (1 + 1e-9))) continue;
+        const t = (c.cx - B.ox) * B.nx + (c.cy - B.oy) * B.ny;      // depth inside B's edge
+        if (!(t > 0)) continue;
+        eat(B, c, cloneOf(B, { big: true, ox: c.cx - t * B.nx, oy: c.cy - t * B.ny, nx: -B.nx, ny: -B.ny }));
+        break;
+      }
+    }
+    if (!eaten) return;
+    let w = 0;
+    for (const c of circles) if (!eaten.has(c)) circles[w++] = c;
+    circles.length = w;
+    w = 0;
+    for (const h of history) if (!(h.type === 'circle' && eaten.has(h.obj))) history[w++] = h;
+    history.length = w;
+    for (const c of clones) { circles.push(c); history.push({ type: 'circle', obj: c }); }
+    normalise();
+    dirty = true;
+  }
+
   let dirty = true;
   function draw(now) {
     now = now || performance.now();
@@ -414,6 +495,7 @@
       normalise();
       dirty = true;
     }
+    eatStep();
     if (dirty) {
       dirty = false;
       ctx.clearRect(0, 0, W, H);
