@@ -71,6 +71,21 @@
   // Lines: pts is a flat [x0, y0, x1, y1, ...] smoothed polyline in screen
   // coordinates, w its thickness. raw holds the finger points while drawing.
   const strokes = [];
+  const history = [];  // circles and lines in the order they were made, for undo
+  function undoLast() {
+    while (history.length) {
+      const item = history.pop();
+      const list = item.type === 'circle' ? circles : strokes;
+      const i = list.indexOf(item.obj);
+      if (i < 0) continue;
+      list.splice(i, 1);
+      dirty = true;
+      toast(item.type === 'circle' ? 'Removed circle' : 'Removed line');
+      if (navigator.vibrate) navigator.vibrate(10);
+      return;
+    }
+    toast('Nothing to remove');
+  }
 
   // Smooth a flat point list with Chaikin corner-cutting, keeping both ends.
   function smooth(raw, passes) {
@@ -355,6 +370,7 @@
   function startCircle() {
     const c = { cx: press.x, cy: press.y, r: 0, color: WHITE };
     circles.push(c);
+    history.push({ type: 'circle', obj: c });
     press.circle = c;
     press.last = performance.now();
     const grow = (now) => {
@@ -381,6 +397,7 @@
       clearTimeout(press.timer);
       press.stroke = { raw: [press.x0, press.y0], pts: [press.x0, press.y0], w: LINE_WIDTH, box: null };
       strokes.push(press.stroke);
+      history.push({ type: 'line', obj: press.stroke });
     }
     const st = press.stroke, r = st.raw;
     if (Math.hypot(x - r[r.length - 2], y - r[r.length - 1]) < 3) return;
@@ -392,7 +409,10 @@
     const r = st.raw;
     let len = 0;
     for (let i = 0; i + 3 < r.length; i += 2) len += Math.hypot(r[i + 2] - r[i], r[i + 3] - r[i + 1]);
-    if (!keep && len < 40) strokes.splice(strokes.indexOf(st), 1);  // a stray start of a pinch
+    if (!keep && len < 40) {                       // a stray start of a pinch
+      strokes.splice(strokes.indexOf(st), 1);
+      const h = history.findIndex(x => x.obj === st); if (h >= 0) history.splice(h, 1);
+    }
     else { st.pts = smooth(r, 3); st.box = null; }
     delete st.raw;
     dirty = true;
@@ -433,6 +453,36 @@
   let pinch = null;          // {d, a, mx, my} from the previous frame
   let gestureUsed = false;   // true once a pinch happened, until every finger is up
   let twoHold = null;        // {timer, start} while two fingers rest still
+  // A quick two-finger swipe left removes the last circle or line. While two
+  // fingers are down we remember the total zoom/pan/twist (as z -> A*z + B on
+  // complex numbers) so a swipe can put the view back where it was.
+  let swipe = null;          // {t0, start, ar, ai, br, bi}
+  const SWIPE_MS = 800, SWIPE_PX = 70;
+  function trackSwipe(k, px, py, dx, dy, a) {
+    if (!swipe) return;
+    const sr = k * Math.cos(a), si = k * Math.sin(a);                 // step A
+    const tr = px - (sr * px - si * py) + dx, ti = py - (si * px + sr * py) + dy; // step B
+    const ar = sr * swipe.ar - si * swipe.ai, ai = sr * swipe.ai + si * swipe.ar;
+    const br = sr * swipe.br - si * swipe.bi + tr, bi = sr * swipe.bi + si * swipe.br + ti;
+    swipe.ar = ar; swipe.ai = ai; swipe.br = br; swipe.bi = bi;
+  }
+  function finishSwipe(last) {
+    const sw = swipe; swipe = null;
+    if (!sw || !last) return;
+    const mx = last.mx - sw.start.mx, my = last.my - sw.start.my;
+    let turn = Math.abs(last.a - sw.start.a); if (turn > Math.PI) turn = 2 * Math.PI - turn;
+    const ratio = last.d / sw.start.d;
+    const isSwipe = performance.now() - sw.t0 < SWIPE_MS && mx < -SWIPE_PX && Math.abs(my) < 0.6 * -mx &&
+                    ratio > 0.75 && ratio < 1.33 && turn < 0.4;
+    if (!isSwipe) return;
+    // Undo the pan the swipe caused: apply the inverse of z -> A*z + B.
+    const m2 = sw.ar * sw.ar + sw.ai * sw.ai;
+    const ir = sw.ar / m2, ii = -sw.ai / m2;                       // 1/A
+    const k = Math.sqrt(ir * ir + ii * ii), a = Math.atan2(ii, ir);
+    const ibr = -(ir * sw.br - ii * sw.bi), ibi = -(ir * sw.bi + ii * sw.br); // -B/A
+    transformAll(k, 0, 0, ibr, ibi, a);
+    undoLast();
+  }
   const pts = () => [...touches.values()];
   function pinchState() {
     const [a, b] = pts();
@@ -453,6 +503,7 @@
       pinch = pinchState();
       cancelTwoHold();
       if (touches.size === 2) {
+        swipe = { t0: performance.now(), start: pinch, ar: 1, ai: 0, br: 0, bi: 0 };
         twoHold = { start: pinch, timer: setTimeout(() => { twoHold = null; toggleForces(); }, FORCE_HOLD_MS) };
       }
     }
@@ -468,6 +519,7 @@
       let da = now.a - pinch.a;               // twist between frames, kept within ±180°
       if (da > Math.PI) da -= 2 * Math.PI; else if (da < -Math.PI) da += 2 * Math.PI;
       transformAll(now.d / pinch.d, pinch.mx, pinch.my, now.mx - pinch.mx, now.my - pinch.my, da);
+      trackSwipe(now.d / pinch.d, pinch.mx, pinch.my, now.mx - pinch.mx, now.my - pinch.my, da);
       pinch = now;
       if (twoHold) {             // moving the fingers means pinching, not holding
         const s0 = twoHold.start;
@@ -479,6 +531,7 @@
   function cancelTwoHold() { if (twoHold) { clearTimeout(twoHold.timer); twoHold = null; } }
   function liftTouches(e, cancelled) {
     cancelTwoHold();
+    if (swipe) finishSwipe(cancelled ? null : pinch);
     for (const t of e.changedTouches) {
       touches.delete(t.identifier);
       if (press && press.id === t.identifier) endPress(!cancelled && !gestureUsed);
