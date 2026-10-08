@@ -11,16 +11,14 @@
   html,body{margin:0;height:100%;overflow:hidden;touch-action:none;overscroll-behavior:none;
     -webkit-tap-highlight-color:transparent;-webkit-touch-callout:none;user-select:none;-webkit-user-select:none}
   body{background:hsl(200,70%,55%);transition:background-color .35s ease;cursor:pointer}
-  #world{position:fixed;left:0;top:0;width:0;height:0;transform-origin:0 0;pointer-events:none}
-  .circle{position:absolute;width:0;height:0;border-radius:50%;transform:translate(-50%,-50%);background:#fff}
+  canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
 </style>
 </head>
 <body>
-<div id="world"></div>
+<canvas id="c"></canvas>
 <script>
   const HOLD_MS = 500;         // how long to hold before a circle appears
   const GROW_PX_PER_S = 160;   // how fast a circle's radius grows, in screen pixels
-  const MIN_ZOOM = 0.2, MAX_ZOOM = 10;
 
   // ----- Colour -----
   let hue = Math.floor(Math.random() * 360);
@@ -33,37 +31,110 @@
   function nextHue() { hue = (hue + 40 + Math.floor(Math.random() * 240)) % 360; paint(); }
   paint();
 
-  // ----- Zoomable layer holding the circles -----
-  const world = document.getElementById('world');
-  const view = { s: 1, tx: 0, ty: 0 };
-  const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
-  function applyView() { world.style.transform = `translate(${view.tx}px, ${view.ty}px) scale(${view.s})`; }
-  const toWorld = (x, y) => ({ x: (x - view.tx) / view.s, y: (y - view.ty) / view.s });
-  // Zoom to scale s while keeping world point (wx, wy) under screen point (sx, sy).
-  function zoomTo(s, wx, wy, sx, sy) {
-    view.s = clamp(s, MIN_ZOOM, MAX_ZOOM);
-    view.tx = sx - wx * view.s;
-    view.ty = sy - wy * view.s;
-    applyView();
+  // ----- Circles, stored in screen coordinates so zoom has no limits -----
+  // Every zoom or pan is applied directly to each circle. Small circles keep a
+  // centre point. Huge ones (bigger than BIG) are kept as "the point on the edge
+  // nearest the screen, plus the direction to the centre", re-anchored every
+  // frame, so their edges stay sharp however far you zoom in.
+  const BIG = 2e6, SMALL = 1e6;
+  const circles = [];  // {cx, cy, r} or {big:true, ox, oy, nx, ny, r}
+  let W = innerWidth, H = innerHeight;
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  function resize() {
+    W = innerWidth; H = innerHeight;
+    const d = devicePixelRatio || 1;
+    canvas.width = Math.round(W * d); canvas.height = Math.round(H * d);
+    ctx.setTransform(d, 0, 0, d, 0, 0);
+    dirty = true;
   }
-  applyView();
+
+  // Scale everything by k around screen point (px, py), then move by (dx, dy).
+  function transformAll(k, px, py, dx, dy) {
+    for (const c of circles) {
+      if (c.big) { c.ox = px + (c.ox - px) * k + dx; c.oy = py + (c.oy - py) * k + dy; }
+      else       { c.cx = px + (c.cx - px) * k + dx; c.cy = py + (c.cy - py) * k + dy; }
+      c.r *= k;
+    }
+    normalise();
+    dirty = true;
+  }
+
+  function normalise() {
+    const sx = W / 2, sy = H / 2;
+    for (const c of circles) {
+      if (!c.big && c.r > BIG) {
+        let dx = sx - c.cx, dy = sy - c.cy, L = Math.hypot(dx, dy);
+        if (L === 0) { dx = 1; dy = 0; L = 1; }
+        c.big = true;
+        c.ox = c.cx + dx / L * c.r; c.oy = c.cy + dy / L * c.r;
+        c.nx = -dx / L; c.ny = -dy / L;
+      } else if (c.big && c.r < SMALL) {
+        c.big = false;
+        c.cx = c.ox + c.nx * c.r; c.cy = c.oy + c.ny * c.r;
+      }
+      if (c.big) {
+        // Slide the anchor along the edge to the point nearest the screen centre.
+        const ux = -c.ny, uy = c.nx;
+        const t = (sx - c.ox) * ux + (sy - c.oy) * uy;
+        if (!isFinite(c.r)) { c.ox += ux * t; c.oy += uy * t; continue; }
+        if (Math.abs(t) >= c.r) continue;
+        const root = Math.sqrt((c.r - t) * (c.r + t));
+        const sag = t * t / (c.r + root);
+        c.ox += ux * t + c.nx * sag; c.oy += uy * t + c.ny * sag;
+        let nx = c.nx * (1 - sag / c.r) - ux * (t / c.r), ny = c.ny * (1 - sag / c.r) - uy * (t / c.r);
+        const L = Math.hypot(nx, ny); c.nx = nx / L; c.ny = ny / L;
+      }
+    }
+  }
+
+  let dirty = true;
+  function draw() {
+    if (dirty) {
+      dirty = false;
+      ctx.clearRect(0, 0, W, H);
+      ctx.fillStyle = '#fff';
+      const sx = W / 2, sy = H / 2, diag = Math.hypot(W, H);
+      for (const c of circles) {
+        if (c.r <= 0) continue;
+        if (!c.big) {
+          const d = Math.hypot(c.cx - sx, c.cy - sy);
+          if (d - c.r > diag) continue;                                     // off screen
+          if (c.r - d > diag) { ctx.fillRect(0, 0, W, H); continue; }      // covers screen
+          ctx.beginPath(); ctx.arc(c.cx, c.cy, c.r, 0, Math.PI * 2); ctx.fill();
+        } else {
+          // So big its edge is a straight line on screen: fill that side.
+          const inside = (sx - c.ox) * c.nx + (sy - c.oy) * c.ny;
+          if (inside > diag) { ctx.fillRect(0, 0, W, H); continue; }
+          if (inside < -diag) continue;
+          const ux = -c.ny, uy = c.nx, B = diag * 2;
+          ctx.beginPath();
+          ctx.moveTo(c.ox + ux * B, c.oy + uy * B);
+          ctx.lineTo(c.ox - ux * B, c.oy - uy * B);
+          ctx.lineTo(c.ox - ux * B + c.nx * B, c.oy - uy * B + c.ny * B);
+          ctx.lineTo(c.ox + ux * B + c.nx * B, c.oy + uy * B + c.ny * B);
+          ctx.closePath(); ctx.fill();
+        }
+      }
+    }
+    requestAnimationFrame(draw);
+  }
+  addEventListener('resize', resize);
+  resize();
+  requestAnimationFrame(draw);
 
   // ----- Press: tap for colour, hold to grow a circle -----
-  let press = null; // {id, x, y, timer, circle, start, raf}
-
+  let press = null; // {id, x, y, timer, circle, last, raf}
   function startCircle() {
-    const p = toWorld(press.x, press.y);
-    const el = document.createElement('div');
-    el.className = 'circle';
-    el.style.left = p.x + 'px';
-    el.style.top = p.y + 'px';
-    world.appendChild(el);
-    press.circle = el;
-    press.start = performance.now();
+    const c = { cx: press.x, cy: press.y, r: 0 };
+    circles.push(c);
+    press.circle = c;
+    press.last = performance.now();
     const grow = (now) => {
-      if (!press || press.circle !== el) return;
-      const screenR = ((now - press.start) / 1000) * GROW_PX_PER_S;
-      el.style.width = el.style.height = (2 * screenR / view.s) + 'px';
+      if (!press || press.circle !== c) return;
+      c.r += (now - press.last) / 1000 * GROW_PX_PER_S;
+      press.last = now;
+      normalise(); dirty = true;
       press.raf = requestAnimationFrame(grow);
     };
     press.raf = requestAnimationFrame(grow);
@@ -88,16 +159,12 @@
 
   // ----- Touch: one finger presses, two fingers pinch to zoom and pan -----
   const touches = new Map(); // id -> {x, y}
-  let pinch = null;          // {d0, s0, wx, wy}
+  let pinch = null;          // {d, mx, my} from the previous frame
   let gestureUsed = false;   // true once a pinch happened, until every finger is up
-
   const pts = () => [...touches.values()];
-  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y) || 1;
-  const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
-  function startPinch() {
+  function pinchState() {
     const [a, b] = pts();
-    const m = mid(a, b), w = toWorld(m.x, m.y);
-    pinch = { d0: dist(a, b), s0: view.s, wx: w.x, wy: w.y };
+    return { d: Math.hypot(a.x - b.x, a.y - b.y) || 1, mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
   }
 
   const opts = { passive: false };
@@ -110,7 +177,7 @@
     } else if (touches.size >= 2) {
       endPress(false);          // a second finger means zoom, not a tap or hold
       gestureUsed = true;
-      startPinch();
+      pinch = pinchState();
     }
   }, opts);
   document.addEventListener('touchmove', (e) => {
@@ -120,8 +187,9 @@
       movePress(t.identifier, t.clientX, t.clientY);
     }
     if (pinch && touches.size >= 2) {
-      const [a, b] = pts(), m = mid(a, b);
-      zoomTo(pinch.s0 * dist(a, b) / pinch.d0, pinch.wx, pinch.wy, m.x, m.y);
+      const now = pinchState();
+      transformAll(now.d / pinch.d, pinch.mx, pinch.my, now.mx - pinch.mx, now.my - pinch.my);
+      pinch = now;
     }
   }, opts);
   function liftTouches(e, cancelled) {
@@ -129,8 +197,7 @@
       touches.delete(t.identifier);
       if (press && press.id === t.identifier) endPress(!cancelled && !gestureUsed);
     }
-    if (touches.size >= 2) startPinch();   // re-anchor if fingers changed mid-pinch
-    else pinch = null;
+    pinch = touches.size >= 2 ? pinchState() : null;
     if (touches.size === 0) gestureUsed = false;
   }
   document.addEventListener('touchend', (e) => { e.preventDefault(); liftTouches(e, false); }, opts);
@@ -143,10 +210,12 @@
   document.addEventListener('pointercancel', (e) => { if (e.pointerType !== 'touch') endPress(false); });
   document.addEventListener('wheel', (e) => {
     e.preventDefault();
-    const w = toWorld(e.clientX, e.clientY);
-    zoomTo(view.s * Math.exp(-e.deltaY * 0.0015), w.x, w.y, e.clientX, e.clientY);
+    transformAll(Math.exp(-e.deltaY * 0.0015), e.clientX, e.clientY, 0, 0);
   }, { passive: false });
   document.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  // For testing: window.__hue exposes state.
+  window.__hue = { circles, transformAll };
 </script>
 </body>
 </html>
