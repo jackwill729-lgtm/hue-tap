@@ -5,26 +5,82 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#3ccfd9">
 <title>Hue Tap</title>
 <style>
-  html,body{margin:0;height:100%;overflow:hidden;touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none}
+  html,body{margin:0;height:100%;overflow:hidden;touch-action:none;overscroll-behavior:none;
+    -webkit-tap-highlight-color:transparent;-webkit-touch-callout:none;user-select:none;-webkit-user-select:none}
   body{background:hsl(200,70%,55%);transition:background-color .35s ease;cursor:pointer}
+  .circle{position:fixed;left:0;top:0;width:2px;height:2px;margin:-1px 0 0 -1px;border-radius:50%;
+    background:#fff;pointer-events:none;will-change:transform,opacity;transition:opacity .6s ease}
 </style>
 </head>
 <body>
 <script>
-  let hue = Math.floor(Math.random()*360);
-  const paint = () => {
+  const HOLD_MS = 2000;        // how long to hold before the circle appears
+  const GROW_PX_PER_S = 320;   // how fast the circle's radius grows
+
+  let hue = Math.floor(Math.random() * 360);
+  const theme = document.querySelector('meta[name=theme-color]');
+  function paint() {
     const c = `hsl(${hue},70%,55%)`;
     document.body.style.backgroundColor = c;
-    document.querySelector('meta[name=theme-color]')?.setAttribute('content', c);
-  };
-  const m = document.createElement('meta'); m.name='theme-color'; document.head.appendChild(m);
-  paint();
-  document.addEventListener('pointerdown', () => {
-    hue = (hue + 40 + Math.floor(Math.random()*240)) % 360;
+    theme.setAttribute('content', c);
+  }
+  function nextHue() {
+    hue = (hue + 40 + Math.floor(Math.random() * 240)) % 360;
     paint();
+  }
+  paint();
+
+  // One active press at a time.
+  let press = null; // {id, x, y, timer, circle, start, raf}
+
+  function startCircle() {
+    const el = document.createElement('div');
+    el.className = 'circle';
+    el.style.transform = `translate(${press.x}px, ${press.y}px) scale(0)`;
+    document.body.appendChild(el);
+    press.circle = el;
+    press.start = performance.now();
+    const grow = (now) => {
+      if (!press || press.circle !== el) return;
+      const r = ((now - press.start) / 1000) * GROW_PX_PER_S;
+      el.style.transform = `translate(${press.x}px, ${press.y}px) scale(${r})`;
+      press.raf = requestAnimationFrame(grow);
+    };
+    press.raf = requestAnimationFrame(grow);
+    if (navigator.vibrate) navigator.vibrate(15);
+  }
+
+  function endPress(e, cancelled) {
+    if (!press || e.pointerId !== press.id) return;
+    clearTimeout(press.timer);
+    cancelAnimationFrame(press.raf);
+    if (press.circle) {
+      // Held long enough: stop growing, then fade the circle away.
+      const el = press.circle;
+      el.style.opacity = '0';
+      setTimeout(() => el.remove(), 700);
+    } else if (!cancelled) {
+      // Short tap: change the colour.
+      nextHue();
+    }
+    press = null;
+  }
+
+  document.addEventListener('pointerdown', (e) => {
+    if (press) return;
+    document.body.setPointerCapture?.(e.pointerId);
+    press = { id: e.pointerId, x: e.clientX, y: e.clientY, circle: null };
+    press.timer = setTimeout(startCircle, HOLD_MS);
   });
+  document.addEventListener('pointermove', (e) => {
+    if (press && e.pointerId === press.id && !press.circle) { press.x = e.clientX; press.y = e.clientY; }
+  });
+  document.addEventListener('pointerup', (e) => endPress(e, false));
+  document.addEventListener('pointercancel', (e) => endPress(e, true));
+  document.addEventListener('contextmenu', (e) => e.preventDefault());
 </script>
 </body>
 </html>
