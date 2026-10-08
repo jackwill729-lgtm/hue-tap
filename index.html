@@ -11,8 +11,8 @@
   html,body{margin:0;height:100%;overflow:hidden;touch-action:none;overscroll-behavior:none;
     -webkit-tap-highlight-color:transparent;-webkit-touch-callout:none;user-select:none;-webkit-user-select:none}
   body{background:hsl(200,70%,55%);transition:background-color .35s ease;cursor:pointer}
-  .circle{position:fixed;left:0;top:0;width:2px;height:2px;margin:-1px 0 0 -1px;border-radius:50%;
-    background:#fff;pointer-events:none;will-change:transform,opacity;transition:opacity .6s ease}
+  .circle{position:fixed;width:0;height:0;border-radius:50%;transform:translate(-50%,-50%);
+    background:#fff;pointer-events:none;transition:opacity .6s ease}
 </style>
 </head>
 <body>
@@ -39,14 +39,15 @@
   function startCircle() {
     const el = document.createElement('div');
     el.className = 'circle';
-    el.style.transform = `translate(${press.x}px, ${press.y}px) scale(0)`;
+    el.style.left = press.x + 'px';
+    el.style.top = press.y + 'px';
     document.body.appendChild(el);
     press.circle = el;
     press.start = performance.now();
     const grow = (now) => {
       if (!press || press.circle !== el) return;
       const r = ((now - press.start) / 1000) * GROW_PX_PER_S;
-      el.style.transform = `translate(${press.x}px, ${press.y}px) scale(${r})`;
+      el.style.width = el.style.height = (2 * r) + 'px';
       press.raf = requestAnimationFrame(grow);
     };
     press.raf = requestAnimationFrame(grow);
