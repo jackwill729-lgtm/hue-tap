@@ -15,12 +15,20 @@
   #toast{position:fixed;left:50%;bottom:calc(28px + env(safe-area-inset-bottom));transform:translateX(-50%);
     font:600 15px/1 -apple-system,system-ui,sans-serif;color:#fff;background:rgba(0,0,0,.45);padding:10px 16px;
     border-radius:20px;opacity:0;transition:opacity .4s;pointer-events:none}
+  #score{position:fixed;left:50%;top:calc(14px + env(safe-area-inset-top));transform:translateX(-50%);
+    font:600 14px/1 -apple-system,system-ui,sans-serif;color:#fff;opacity:.85;text-shadow:0 1px 3px rgba(0,0,0,.45);pointer-events:none;white-space:nowrap}
+  #over{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;color:#fff;pointer-events:none;
+    font:600 16px/1.4 -apple-system,system-ui,sans-serif;background:rgba(0,0,0,.5);padding:22px 30px;border-radius:22px;display:none}
+  #over b{display:block;font-size:30px;margin-bottom:6px}
+  #over small{display:block;margin-top:10px;font-size:14px;opacity:.85}
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 <canvas id="o"></canvas>
 <div id="toast"></div>
+<div id="score"></div>
+<div id="over"><b>Game over</b><span id="overScore"></span><small>Tap to play again</small></div>
 <div id="safe" style="position:fixed;visibility:hidden;pointer-events:none;padding-left:env(safe-area-inset-left,0px);padding-right:env(safe-area-inset-right,0px);padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)"></div>
 <script>
   const HOLD_MS = 500;         // how long to hold before a circle appears
@@ -38,7 +46,13 @@
   const POP_S = 0.25;          // length of the pop animation
   const CLONE_EVERY = 20;      // a hunter clones itself every this many pops
   const EMIT_MEAN_S = 1.2;     // average time between circles from one dot while forces are on
-  const FRAME_BUDGET_MS = 12;  // physics time per frame; beyond this the simulation slows rather than freezes
+  const FRAME_BUDGET_MS = 12;
+  const PLAYER_R = 12;         // the white player dot's starting radius, in screen pixels
+  const TILT_DEAD = 3;         // degrees of tilt that do nothing
+  const TILT_FULL = 30;        // degrees of tilt for full speed
+  const TILT_MAX_SPEED = 450;  // screen pixels per second
+  const TILT_SMOOTH_S = 0.08;  // smoothing time constant for the player's speed
+  const INVULN_MS = 2000;      // blinking safe time after a restart  // physics time per frame; beyond this the simulation slows rather than freezes
 
   // ----- Colour -----
   // The background and every tapped circle each have their own hue, and no two
@@ -88,6 +102,12 @@
   const pops = [];     // {x, y, r, color, t0}: pop animations, in screen coordinates
   // Blue chasers dragged out of the top corner: they go after hunters.
   const chasers = [];  // {cx, cy, r} or the big form
+  // The player: a white dot pinned to the screen centre. Tilting moves the world
+  // the other way, so the dot seems to travel. It eats smaller circles and grows;
+  // bigger circles and hunters end the game. size = growth since the start
+  // (independent of zoom); invUntil = end of the blinking safe time.
+  let playerOn = true;   // tests can switch the player off
+  const player = { cx: 0, cy: 0, r: PLAYER_R, eaten: 0, size: 1, over: false, invUntil: 0, vx: 0, vy: 0 };
   const history = [];  // circles, lines, dots, hunters and chasers in the order they were made, for undo
   function undoLast() {
     while (history.length) {
@@ -182,6 +202,7 @@
       if (c.vx) { const vx = c.vx, vy = c.vy; c.vx = vx * cos - vy * sin; c.vy = vx * sin + vy * cos; }
       c.r *= k;
     }
+    player.r *= k;
     for (const st of strokes) {
       for (const arr of [st.pts, st.raw]) {
         if (!arr) continue;
@@ -609,14 +630,18 @@
     const held = press && press.circle;
     // Targets are sticky: a hunter keeps its circle until it pops it. It only loses
     // it if the circle disappears some other way (eaten, undone), and then looks again.
+    // The player is one more target, while it can be caught.
+    const prey = playerLive() && !invulnerable(now) ? player : null;
     const alive = new Set(circles), claimed = new Set();
+    if (prey) alive.add(prey);
     for (const h of hunters) {
       if (h.target && !alive.has(h.target)) h.target = null;
       if (h.target) claimed.add(h.target);
     }
     const active = hunters.filter(h => !h.big && h.r > 0 && isFinite(h.cx) && isFinite(h.cy));  // huge hunters wait until zoomed out
-    if (!active.length || !circles.length) return;
+    if (!active.length || (!circles.length && !prey)) return;
     const elig = circles.filter(c => c !== held && c.r > 0);
+    if (prey) elig.push(prey);
     if (!elig.length) return;
     buildGrid(elig); if (grid) grid.list = elig;
     // Hunters without a target share out the unclaimed circles, closest pair first;
@@ -641,6 +666,7 @@
         if (g > step) { h.cx += ux * step; h.cy += uy * step; break; }
         const go = Math.max(0, g);
         h.cx += ux * go; h.cy += uy * go; step -= go;
+        if (tgt === player) { claimed.add(tgt); h.target = null; gameOver(now, '#ff2a2a'); break; }   // caught
         (popped || (popped = new Set())).add(tgt); claimed.add(tgt);
         if (!tgt.big) pops.push({ x: tgt.cx, y: tgt.cy, r: tgt.r, color: tgt.color, t0: now });
         tgt = null; h.target = null;
@@ -745,6 +771,165 @@
   }
   const BLUE = '#2a7bff';
 
+  // ----- Player -----
+  // Tilt: the first reading after load (and after each restart) is the neutral pose.
+  let neutral = null, tiltX = 0, tiltY = 0;   // tilt from neutral in screen axes, degrees
+  const keys = new Set();
+  const wrap180 = (d) => ((d % 360) + 540) % 360 - 180;
+  function onTilt(beta, gamma) {
+    if (beta == null || gamma == null || !isFinite(beta) || !isFinite(gamma)) return;   // no sensor
+    if (!neutral) neutral = { beta, gamma };
+    const tx = wrap180(gamma - neutral.gamma);   // right edge down: towards screen right (portrait)
+    const ty = wrap180(beta - neutral.beta);     // top away from you: beta falls, towards screen top
+    let ang = screen.orientation && typeof screen.orientation.angle === 'number' ? screen.orientation.angle : (window.orientation || 0);
+    ang = ((Math.round(ang / 90) % 4) + 4) % 4;
+    [tiltX, tiltY] = ang === 0 ? [tx, ty] : ang === 1 ? [ty, -tx] : ang === 2 ? [-tx, -ty] : [-ty, tx];
+  }
+  addEventListener('deviceorientation', (e) => onTilt(e.beta, e.gamma));
+  let askedTilt = false;
+  function askTiltPermission() {     // iOS needs a tap before it shares the sensor
+    if (askedTilt) return; askedTilt = true;
+    const D = window.DeviceOrientationEvent;
+    if (D && typeof D.requestPermission === 'function') D.requestPermission().catch(() => {});
+  }
+  const playerLive = () => playerOn && !player.over && player.r >= 1e-6 && player.r <= BIG;   // paused at extreme zoom
+  const invulnerable = (now) => now < player.invUntil;
+  // Move the world opposite to the tilt (or arrow keys), sliding the player along lines.
+  const pBody = { cx: 0, cy: 0, r: 0, vx: 0, vy: 0 };
+  function movePlayer(dt) {
+    let vx = 0, vy = 0;
+    if (playerOn && !player.over) {
+      const m = Math.hypot(tiltX, tiltY);
+      if (m > TILT_DEAD) {
+        const sp = TILT_MAX_SPEED * Math.min(1, (m - TILT_DEAD) / (TILT_FULL - TILT_DEAD));
+        vx = tiltX / m * sp; vy = tiltY / m * sp;
+      }
+      const kx = (keys.has('right') ? 1 : 0) - (keys.has('left') ? 1 : 0), ky = (keys.has('down') ? 1 : 0) - (keys.has('up') ? 1 : 0);
+      if (kx || ky) { const L = Math.hypot(kx, ky); vx += kx / L * TILT_MAX_SPEED; vy += ky / L * TILT_MAX_SPEED; }
+      const v = Math.hypot(vx, vy);
+      if (v > TILT_MAX_SPEED) { vx *= TILT_MAX_SPEED / v; vy *= TILT_MAX_SPEED / v; }
+    }
+    const f = 1 - Math.exp(-dt / TILT_SMOOTH_S);
+    player.vx += (vx - player.vx) * f; player.vy += (vy - player.vy) * f;
+    if (!vx && !vy && Math.hypot(player.vx, player.vy) < 1) { player.vx = 0; player.vy = 0; }
+    if (!playerOn || player.over || (!player.vx && !player.vy)) return;
+    const mx = player.vx * dt, my = player.vy * dt, r = player.r;
+    pBody.cx = W / 2; pBody.cy = H / 2; pBody.r = r;
+    const solid = strokes.length && r > 0 && r <= BIG;
+    // Small steps (half a radius at most) so the player can't jump through a line.
+    const n = solid ? Math.min(64, Math.max(1, Math.ceil(Math.hypot(mx, my) / (0.5 * r)))) : 1;
+    for (let i = 0; i < n; i++) {
+      pBody.cx += mx / n; pBody.cy += my / n;
+      if (solid) collideLines([pBody]);     // pushed back out: the part of the move into the line is removed
+    }
+    const dx = pBody.cx - W / 2, dy = pBody.cy - H / 2;
+    if (dx || dy) transformAll(1, 0, 0, -dx, -dy);
+  }
+  // Eat smaller circles more than half covered; a bigger circle covering more than
+  // half of the player ends the game (and clones itself, like any eater).
+  function playerStep(now) {
+    if (!playerLive()) return;
+    const held = press && press.circle, px = W / 2, py = H / 2;
+    let gone = null;
+    for (const c of circles) {
+      if (c === held || c.big || !(c.r > 0)) continue;
+      const P = player.r;
+      if (!(P > c.r * (1 + 1e-9))) continue;
+      const dx = c.cx - px, dy = c.cy - py;
+      if (Math.abs(dx) >= P || Math.abs(dy) >= P) continue;
+      const d2 = dx * dx + dy * dy;
+      if (d2 >= P * P) continue;
+      const d = Math.sqrt(d2);
+      if (d + c.r > P && lensFrac(P, c.r, d) <= 0.5) continue;
+      const g = Math.sqrt(1 + (c.r / P) ** 2);    // grow by area: r² + rc²
+      player.r = P * g; player.size *= g; player.eaten++;
+      (gone || (gone = new Set())).add(c);
+      pops.push({ x: c.cx, y: c.cy, r: c.r, color: '#FFFFFF', t0: now });
+    }
+    if (gone) {
+      let w = 0;
+      for (const c of circles) if (!gone.has(c)) circles[w++] = c;
+      circles.length = w;
+      w = 0;
+      for (const h of history) if (!(h.type === 'circle' && gone.has(h.obj))) history[w++] = h;
+      history.length = w;
+      dirty = true;
+    }
+    if (invulnerable(now)) return;
+    const P = player.r;
+    for (const c of circles) {
+      if (c === held || !(c.r > P * (1 + 1e-9))) continue;
+      let clone;
+      if (c.big) {
+        const t = (px - c.ox) * c.nx + (py - c.oy) * c.ny;
+        if (!(t > 0)) continue;
+        clone = cloneOf(c, { big: true, ox: px - t * c.nx, oy: py - t * c.ny, nx: -c.nx, ny: -c.ny });
+      } else {
+        const R = c.r, dx = px - c.cx, dy = py - c.cy;
+        if (Math.abs(dx) >= R || Math.abs(dy) >= R) continue;
+        const d2 = dx * dx + dy * dy;
+        if (d2 >= R * R) continue;
+        const d = Math.sqrt(d2);
+        if (d + P > R && lensFrac(R, P, d) <= 0.5) continue;
+        let ux, uy;
+        if (d > 0) { ux = dx / d; uy = dy / d; } else { const a = Math.random() * Math.PI * 2; ux = Math.cos(a); uy = Math.sin(a); }
+        clone = cloneOf(c, { cx: c.cx + ux * 2 * R, cy: c.cy + uy * 2 * R });
+      }
+      circles.push(clone); history.push({ type: 'circle', obj: clone });
+      normalise();
+      gameOver(now, c.color || '#FFFFFF');
+      return;
+    }
+  }
+  // A hunter touching the player ends the game too.
+  function catchStep(now) {
+    if (!playerLive() || invulnerable(now)) return;
+    const px = W / 2, py = H / 2;
+    for (const h of hunters) {
+      if (h.big || !(h.r > 0)) continue;
+      if (Math.hypot(h.cx - px, h.cy - py) <= player.r + h.r) { gameOver(now, '#ff2a2a'); return; }
+    }
+  }
+  const scoreEl = document.getElementById('score'), overEl = document.getElementById('over');
+  let shownScore = null;
+  function showScore() {
+    const t = playerOn ? 'Eaten ' + player.eaten : '';
+    if (t !== shownScore) { scoreEl.textContent = t; shownScore = t; }
+  }
+  function gameOver(now, color) {
+    player.over = true; player.vx = 0; player.vy = 0;
+    for (const h of hunters) if (h.target === player) h.target = null;
+    pops.push({ x: W / 2, y: H / 2, r: Math.min(player.r, 4 * Math.hypot(W, H)) * 1.5, color, t0: now });
+    const size = player.size < 10 ? player.size.toFixed(1) : player.size < 1e6 ? Math.round(player.size) : player.size.toExponential(1);
+    document.getElementById('overScore').textContent = `Ate ${player.eaten} circle${player.eaten === 1 ? '' : 's'} · size ${size}×`;
+    overEl.style.display = 'block';
+    dirty = true;
+    if (navigator.vibrate) navigator.vibrate([40, 40, 120]);
+  }
+  function restart() {
+    Object.assign(player, { r: PLAYER_R, eaten: 0, size: 1, over: false, vx: 0, vy: 0, invUntil: performance.now() + INVULN_MS });
+    neutral = null; tiltX = 0; tiltY = 0;       // the next reading is the new neutral pose
+    overEl.style.display = 'none';
+    dirty = true;
+  }
+  // White with a soft glow and a thin dark ring, so it never looks like a white circle.
+  function drawPlayer(now) {
+    if (!playerOn) return;
+    const p = { cx: W / 2, cy: H / 2, r: Math.max(player.r, 2) };   // never smaller than a speck on screen
+    if (!(p.r < Infinity)) p.r = 4 * Math.hypot(W, H);
+    ctx.save();
+    ctx.globalAlpha = player.over ? 0.45 : invulnerable(now) && Math.floor(now / 125) % 2 ? 0.25 : 1;
+    ctx.shadowColor = 'rgba(255,255,255,.95)'; ctx.shadowBlur = Math.min(14, p.r);
+    ctx.fillStyle = '#FFFFFF';
+    const ring = fillDisc(p) && p.r < 1e5;
+    ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
+    if (ring) {
+      ctx.lineWidth = Math.min(1.5, p.r * 0.2); ctx.strokeStyle = 'rgba(0,0,0,.6)';
+      ctx.beginPath(); ctx.arc(p.cx, p.cy, p.r, 0, Math.PI * 2); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   let dirty = true;
   function draw(now) {
     now = now || performance.now();
@@ -766,8 +951,14 @@
       normalise();
       dirty = true;
     }
+    player.cx = W / 2; player.cy = H / 2;
+    if (dt > 0) movePlayer(dt);
     eatStep();
+    playerStep(now);
     if (dt > 0) { huntStep(dt, now); chaseStep(dt, now); }
+    catchStep(now);
+    if (playerOn && invulnerable(now)) dirty = true;   // blinking
+    showScore();
     if (dirty) {
       dirty = false;
       ctx.clearRect(0, 0, W, H);
@@ -805,6 +996,7 @@
         ctx.stroke();
       }
       for (const d of dots) if (d.r > 0) drawDot(d);
+      drawPlayer(now);
       drawDot({ cx: dockX, cy: dockY, r: DOT_R });                         // the corner dot
       if (dotDrag && dotDrag.kind === 'dot') drawDot({ cx: dotDrag.x, cy: dotDrag.y, r: DOT_R });  // a dot being dragged out
     }
@@ -1001,9 +1193,11 @@
     for (const t of e.changedTouches) touches.set(t.identifier, { x: t.clientX, y: t.clientY });
     if (touches.size === 1 && !gestureUsed) {
       const t = e.changedTouches[0];
-      if (onDock(t.clientX, t.clientY)) beginDot(t.identifier, t.clientX, t.clientY);
+      if (playerOn && player.over) restartTap = t.identifier;   // game over: this tap only restarts
+      else if (onDock(t.clientX, t.clientY)) beginDot(t.identifier, t.clientX, t.clientY);
       else beginPress(t.identifier, t.clientX, t.clientY);
     } else if (touches.size >= 2) {
+      restartTap = null;
       endPress(false);          // a second finger means zoom, not a tap or hold
       endDot(false);
       gestureUsed = true;
@@ -1028,7 +1222,8 @@
       const now = pinchState();
       let da = now.a - pinch.a;               // twist between frames, kept within ±180°
       if (da > Math.PI) da -= 2 * Math.PI; else if (da < -Math.PI) da += 2 * Math.PI;
-      const step = [now.d / pinch.d, pinch.mx, pinch.my, now.mx - pinch.mx, now.my - pinch.my, da];
+      // With the player on, zoom and twist pivot on the screen centre so it stays there.
+      const step = [now.d / pinch.d, playerOn ? W / 2 : pinch.mx, playerOn ? H / 2 : pinch.my, now.mx - pinch.mx, now.my - pinch.my, da];
       transformAll(...step);
       trackTwoTap(...step);
       pinch = now;
@@ -1040,10 +1235,13 @@
     }
   }, opts);
   function cancelTwoHold() { if (twoHold) { clearTimeout(twoHold.timer); twoHold = null; } }
+  let restartTap = null;      // the finger of a tap that will restart after game over
   function liftTouches(e, cancelled) {
     cancelTwoHold();
+    if (!cancelled) askTiltPermission();
     for (const t of e.changedTouches) {
       touches.delete(t.identifier);
+      if (restartTap === t.identifier) { restartTap = null; if (!cancelled && player.over) restart(); }
       if (press && press.id === t.identifier) endPress(!cancelled && !gestureUsed);
       if (dotDrag && dotDrag.id === t.identifier) endDot(!cancelled);
     }
@@ -1058,21 +1256,42 @@
   const isMouse = (e) => e.pointerType !== 'touch';
   document.addEventListener('pointerdown', (e) => {
     if (!isMouse(e)) return;
+    if (playerOn && player.over) { restartTap = 'm'; return; }
     if (onDock(e.clientX, e.clientY)) beginDot('m', e.clientX, e.clientY); else beginPress('m', e.clientX, e.clientY);
   });
   document.addEventListener('pointermove', (e) => { if (isMouse(e)) { movePress('m', e.clientX, e.clientY); moveDot('m', e.clientX, e.clientY); } });
-  document.addEventListener('pointerup', (e) => { if (isMouse(e)) { endPress(true); endDot(true); } });
+  document.addEventListener('pointerup', (e) => {
+    if (!isMouse(e)) return;
+    askTiltPermission();
+    if (restartTap === 'm') { restartTap = null; if (player.over) restart(); return; }
+    endPress(true); endDot(true);
+  });
   document.addEventListener('pointercancel', (e) => { if (isMouse(e)) { endPress(false); endDot(false); } });
   document.addEventListener('wheel', (e) => {
     e.preventDefault();
-    if (e.shiftKey) transformAll(1, e.clientX, e.clientY, 0, 0, (e.deltaY || e.deltaX) * 0.003); // Shift + scroll rotates
-    else transformAll(Math.exp(-e.deltaY * 0.0015), e.clientX, e.clientY, 0, 0);
+    const px = playerOn ? W / 2 : e.clientX, py = playerOn ? H / 2 : e.clientY;
+    if (e.shiftKey) transformAll(1, px, py, 0, 0, (e.deltaY || e.deltaX) * 0.003); // Shift + scroll rotates
+    else transformAll(Math.exp(-e.deltaY * 0.0015), px, py, 0, 0);
   }, { passive: false });
   document.addEventListener('contextmenu', (e) => e.preventDefault());
+  // Arrow keys / WASD move the player at full speed; Enter or Space restarts after game over.
+  const KEY_DIR = { ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down', a: 'left', d: 'right', w: 'up', s: 'down',
+                    A: 'left', D: 'right', W: 'up', S: 'down' };
+  addEventListener('keydown', (e) => {
+    const k = KEY_DIR[e.key];
+    if (k) { keys.add(k); e.preventDefault(); }
+    else if ((e.key === 'Enter' || e.key === ' ') && playerOn && player.over) { restart(); e.preventDefault(); }
+  });
+  addEventListener('keyup', (e) => { const k = KEY_DIR[e.key]; if (k) keys.delete(k); });
+  addEventListener('blur', () => keys.clear());
 
   // For testing: window.__hue exposes state.
   window.__hue = { circles, strokes, dots, hunters, chasers, pops, history, transformAll, get dock() { return { x: dockX, y: dockY, r: DOT_R }; },
-    get redDock() { return { x: redX, y: redY, r: HUNTER_R }; }, get blueDock() { return { x: blueX, y: blueY, r: CHASER_R }; }, get hue() { return hue; }, set hue(h) { hue = h; paint(); }, get forcesOn() { return forcesOn; } };
+    get redDock() { return { x: redX, y: redY, r: HUNTER_R }; }, get blueDock() { return { x: blueX, y: blueY, r: CHASER_R }; }, get hue() { return hue; }, set hue(h) { hue = h; paint(); }, get forcesOn() { return forcesOn; },
+    get player() { return { x: W / 2, y: H / 2, r: player.r, eaten: player.eaten, size: player.size, gameOver: player.over,
+      invulnerable: invulnerable(performance.now()), vx: player.vx, vy: player.vy, tilt: [tiltX, tiltY], on: playerOn }; },
+    playerObj: player, setTilt: onTilt, restart,
+    get playerOn() { return playerOn; }, set playerOn(v) { playerOn = !!v; dirty = true; overEl.style.display = playerOn && player.over ? 'block' : 'none'; } };
 </script>
 </body>
 </html>
