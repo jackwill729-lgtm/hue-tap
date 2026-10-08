@@ -612,8 +612,8 @@
     if (!elig.length) return;
     buildGrid(elig); if (grid) grid.list = elig;
     const claimed = new Set();
-    // More hunters than circles: the spare ones chase the nearest circle anyway.
-    for (const h of assignTargets(active, elig, claimed)) h.target = nearestFree(h, elig, null);
+    // Hunters without a circle of their own stay still this frame (and try again next frame).
+    assignTargets(active, elig, claimed);
     let popped = null;
     const born = [];
     for (const h of active) {
@@ -621,9 +621,9 @@
       // Up to a few pops per frame if circles are packed tight; each move is a
       // straight line to the target's edge, so a fast hunter can't skip past it.
       for (let k = 0; k < 4 && step > 0; k++) {
-        if (tgt && popped && popped.has(tgt)) tgt = null;          // someone else got it first
         if (!tgt) {
-          tgt = nearestFree(h, elig, claimed) || nearestFree(h, elig, popped);
+          if (k === 0) break;                                       // no unique target: stay put
+          tgt = nearestFree(h, elig, claimed);                      // after a pop: next unclaimed circle only
           if (!tgt) break;
           claimed.add(tgt);
         }
