@@ -34,6 +34,7 @@
   const HUNTER_R = 8;          // the red dot in the other corner, and new hunters, in screen pixels
   const HUNTER_SPEED = 25;     // hunter radii per second, so it looks the same at any zoom
   const POP_S = 0.25;          // length of the pop animation
+  const CLONE_EVERY = 20;      // a hunter clones itself every this many pops
   const EMIT_MEAN_S = 1.2;     // average time between circles from one dot while forces are on
   const FRAME_BUDGET_MS = 12;  // physics time per frame; beyond this the simulation slows rather than freezes
 
@@ -492,6 +493,7 @@
     if (!hunters.length) return;
     const held = press && press.circle;
     let popped = null;
+    const born = [];
     for (const h of hunters) {
       if (h.big || !(h.r > 0) || !isFinite(h.cx) || !isFinite(h.cy)) continue;  // huge hunters wait until zoomed out
       let step = HUNTER_SPEED * h.r * dt;
@@ -519,8 +521,18 @@
         h.cx += bx * go; h.cy += by * go; step -= go;
         (popped || (popped = new Set())).add(best);
         if (!best.big) pops.push({ x: best.cx, y: best.cy, r: best.r, color: best.color, t0: now });
+        // Every 20th pop the hunter clones itself, 2.5 radii away in a random direction.
+        h.popCount = (h.popCount || 0) + 1;
+        if (h.popCount >= CLONE_EVERY) {
+          h.popCount = 0;
+          const a = Math.random() * Math.PI * 2;
+          const c = { cx: h.cx + Math.cos(a) * h.r * 2.5, cy: h.cy + Math.sin(a) * h.r * 2.5, r: h.r, popCount: 0 };
+          born.push(c);
+          pops.push({ x: c.cx, y: c.cy, r: c.r * 1.5, color: '#ff2a2a', t0: now });   // a quick red ring
+        }
       }
     }
+    for (const c of born) { hunters.push(c); history.push({ type: 'hunter', obj: c }); }
     if (!popped) return;
     let w = 0;
     for (const c of circles) if (!popped.has(c)) circles[w++] = c;
@@ -655,7 +667,7 @@
     const { x, y, kind } = dotDrag; dotDrag = null; dirty = true;
     if (!place || onDock(x, y) || x < 0 || y < 0 || x > W || y > H) return;  // dropped back on a corner: cancel
     if (kind === 'hunter') {
-      const h = { cx: x, cy: y, r: HUNTER_R };
+      const h = { cx: x, cy: y, r: HUNTER_R, popCount: 0 };
       hunters.push(h);
       history.push({ type: 'hunter', obj: h });
     } else {
