@@ -525,35 +525,49 @@
   let pinch = null;          // {d, a, mx, my} from the previous frame
   let gestureUsed = false;   // true once a pinch happened, until every finger is up
   let twoHold = null;        // {timer, start} while two fingers rest still
-  // A quick two-finger swipe left removes the last circle or line. While two
-  // fingers are down we remember the total zoom/pan/twist (as z -> A*z + B on
-  // complex numbers) so a swipe can put the view back where it was.
-  let swipe = null;          // {t0, start, ar, ai, br, bi}
-  const SWIPE_MS = 800, SWIPE_PX = 70;
-  function trackSwipe(k, px, py, dx, dy, a) {
-    if (!swipe) return;
+  // Double tap with two fingers removes the last circle, line or dot. A
+  // two-finger tap: both fingers land together, barely move and lift quickly.
+  // While two fingers are down we remember the total zoom/pan/twist they caused
+  // (as z -> A*z + B on complex numbers) so a tap can put the view back exactly.
+  const TAP_MS = 350;        // first finger down to last finger up
+  const TAP_LAND_MS = 150;   // second finger must land this soon after the first
+  const TAP_MOVE = 20;       // max travel of each finger and of the midpoint, px
+  const TAP_TURN = 0.25;     // max twist, radians
+  const DOUBLE_GAP_MS = 450; // end of first tap to start of second
+  const DOUBLE_NEAR = 80;    // second tap's midpoint within this of the first's
+  let firstDownT = 0;        // when the first finger of the current touch landed
+  let twoTap = null;         // {t0, ok, start, fingers, ar, ai, br, bi}
+  let lastTwoTap = null;     // {t, mx, my}: the previous two-finger tap
+  function trackTwoTap(k, px, py, dx, dy, a) {
+    const tt = twoTap; if (!tt) return;
     const sr = k * Math.cos(a), si = k * Math.sin(a);                 // step A
     const tr = px - (sr * px - si * py) + dx, ti = py - (si * px + sr * py) + dy; // step B
-    const ar = sr * swipe.ar - si * swipe.ai, ai = sr * swipe.ai + si * swipe.ar;
-    const br = sr * swipe.br - si * swipe.bi + tr, bi = sr * swipe.bi + si * swipe.br + ti;
-    swipe.ar = ar; swipe.ai = ai; swipe.br = br; swipe.bi = bi;
+    const ar = sr * tt.ar - si * tt.ai, ai = sr * tt.ai + si * tt.ar;
+    const br = sr * tt.br - si * tt.bi + tr, bi = sr * tt.bi + si * tt.br + ti;
+    tt.ar = ar; tt.ai = ai; tt.br = br; tt.bi = bi;
+    if (!tt.ok) return;
+    const now = pinchState(), s0 = tt.start;
+    let turn = Math.abs(now.a - s0.a); if (turn > Math.PI) turn = 2 * Math.PI - turn;
+    let moved = Math.hypot(now.mx - s0.mx, now.my - s0.my) > TAP_MOVE || Math.abs(now.d - s0.d) > TAP_MOVE || turn > TAP_TURN;
+    for (const [id, p] of tt.fingers) { const q = touches.get(id); if (q && Math.hypot(q.x - p.x, q.y - p.y) > TAP_MOVE) moved = true; }
+    if (moved) tt.ok = false;
   }
-  function finishSwipe(last) {
-    const sw = swipe; swipe = null;
-    if (!sw || !last) return;
-    const mx = last.mx - sw.start.mx, my = last.my - sw.start.my;
-    let turn = Math.abs(last.a - sw.start.a); if (turn > Math.PI) turn = 2 * Math.PI - turn;
-    const ratio = last.d / sw.start.d;
-    const isSwipe = performance.now() - sw.t0 < SWIPE_MS && mx < -SWIPE_PX && Math.abs(my) < 0.6 * -mx &&
-                    ratio > 0.75 && ratio < 1.33 && turn < 0.4;
-    if (!isSwipe) return;
-    // Undo the pan the swipe caused: apply the inverse of z -> A*z + B.
-    const m2 = sw.ar * sw.ar + sw.ai * sw.ai;
-    const ir = sw.ar / m2, ii = -sw.ai / m2;                       // 1/A
-    const k = Math.sqrt(ir * ir + ii * ii), a = Math.atan2(ii, ir);
-    const ibr = -(ir * sw.br - ii * sw.bi), ibi = -(ir * sw.bi + ii * sw.br); // -B/A
-    transformAll(k, 0, 0, ibr, ibi, a);
-    undoLast();
+  function finishTwoTap(cancelled) {
+    const tt = twoTap; twoTap = null;
+    const now = performance.now();
+    if (!tt || cancelled || !tt.ok || now - tt.t0 > TAP_MS) { lastTwoTap = null; return; }
+    // Put back any tiny zoom/pan the tap caused: apply the inverse of z -> A*z + B.
+    if (tt.ar !== 1 || tt.ai !== 0 || tt.br !== 0 || tt.bi !== 0) {
+      const m2 = tt.ar * tt.ar + tt.ai * tt.ai;
+      const ir = tt.ar / m2, ii = -tt.ai / m2;                       // 1/A
+      const ibr = -(ir * tt.br - ii * tt.bi), ibi = -(ir * tt.bi + ii * tt.br); // -B/A
+      transformAll(Math.hypot(ir, ii), 0, 0, ibr, ibi, Math.atan2(ii, ir));
+    }
+    const l = lastTwoTap;
+    if (l && tt.t0 - l.t <= DOUBLE_GAP_MS && Math.hypot(tt.start.mx - l.mx, tt.start.my - l.my) <= DOUBLE_NEAR) {
+      lastTwoTap = null;
+      undoLast();
+    } else lastTwoTap = { t: now, mx: tt.start.mx, my: tt.start.my };
   }
   const pts = () => [...touches.values()];
   function pinchState() {
@@ -565,6 +579,7 @@
   const opts = { passive: false };
   document.addEventListener('touchstart', (e) => {
     e.preventDefault();
+    if (touches.size === 0) firstDownT = performance.now();
     for (const t of e.changedTouches) touches.set(t.identifier, { x: t.clientX, y: t.clientY });
     if (touches.size === 1 && !gestureUsed) {
       const t = e.changedTouches[0];
@@ -576,8 +591,10 @@
       gestureUsed = true;
       pinch = pinchState();
       cancelTwoHold();
+      if (twoTap) twoTap.ok = false;   // a third finger: not a tap
       if (touches.size === 2) {
-        swipe = { t0: performance.now(), start: pinch, ar: 1, ai: 0, br: 0, bi: 0 };
+        twoTap = { t0: firstDownT, ok: performance.now() - firstDownT <= TAP_LAND_MS, start: pinch,
+                   fingers: new Map([...touches].map(([id, p]) => [id, { x: p.x, y: p.y }])), ar: 1, ai: 0, br: 0, bi: 0 };
         twoHold = { start: pinch, timer: setTimeout(() => { twoHold = null; toggleForces(); }, FORCE_HOLD_MS) };
       }
     }
@@ -593,8 +610,9 @@
       const now = pinchState();
       let da = now.a - pinch.a;               // twist between frames, kept within ±180°
       if (da > Math.PI) da -= 2 * Math.PI; else if (da < -Math.PI) da += 2 * Math.PI;
-      transformAll(now.d / pinch.d, pinch.mx, pinch.my, now.mx - pinch.mx, now.my - pinch.my, da);
-      trackSwipe(now.d / pinch.d, pinch.mx, pinch.my, now.mx - pinch.mx, now.my - pinch.my, da);
+      const step = [now.d / pinch.d, pinch.mx, pinch.my, now.mx - pinch.mx, now.my - pinch.my, da];
+      transformAll(...step);
+      trackTwoTap(...step);
       pinch = now;
       if (twoHold) {             // moving the fingers means pinching, not holding
         const s0 = twoHold.start;
@@ -606,12 +624,12 @@
   function cancelTwoHold() { if (twoHold) { clearTimeout(twoHold.timer); twoHold = null; } }
   function liftTouches(e, cancelled) {
     cancelTwoHold();
-    if (swipe) finishSwipe(cancelled ? null : pinch);
     for (const t of e.changedTouches) {
       touches.delete(t.identifier);
       if (press && press.id === t.identifier) endPress(!cancelled && !gestureUsed);
       if (dotDrag && dotDrag.id === t.identifier) endDot(!cancelled);
     }
+    if (twoTap && (cancelled || touches.size === 0)) finishTwoTap(cancelled);
     pinch = touches.size >= 2 ? pinchState() : null;
     if (touches.size === 0) gestureUsed = false;
   }
