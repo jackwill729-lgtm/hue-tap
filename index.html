@@ -12,13 +12,13 @@
     -webkit-tap-highlight-color:transparent;-webkit-touch-callout:none;user-select:none;-webkit-user-select:none}
   body{background:hsl(200,70%,55%);transition:background-color .35s ease;cursor:pointer}
   .circle{position:fixed;width:0;height:0;border-radius:50%;transform:translate(-50%,-50%);
-    background:#fff;pointer-events:none;transition:opacity .6s ease}
+    background:#fff;pointer-events:none}
 </style>
 </head>
 <body>
 <script>
-  const HOLD_MS = 2000;        // how long to hold before the circle appears
-  const GROW_PX_PER_S = 320;   // how fast the circle's radius grows
+  const HOLD_MS = 500;         // how long to hold before the circle appears
+  const GROW_PX_PER_S = 160;   // how fast the circle's radius grows
 
   let hue = Math.floor(Math.random() * 360);
   const theme = document.querySelector('meta[name=theme-color]');
@@ -59,10 +59,7 @@
     clearTimeout(press.timer);
     cancelAnimationFrame(press.raf);
     if (press.circle) {
-      // Held long enough: stop growing, then fade the circle away.
-      const el = press.circle;
-      el.style.opacity = '0';
-      setTimeout(() => el.remove(), 700);
+      // Held long enough: the circle stops growing and stays on screen.
     } else if (!cancelled) {
       // Short tap: change the colour.
       nextHue();
