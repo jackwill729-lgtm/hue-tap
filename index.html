@@ -602,18 +602,22 @@
   function huntStep(dt, now) {
     if (!hunters.length) return;
     const held = press && press.circle;
-    const active = [];
+    // Targets are sticky: a hunter keeps its circle until it pops it. It only loses
+    // it if the circle disappears some other way (eaten, undone), and then looks again.
+    const alive = new Set(circles), claimed = new Set();
     for (const h of hunters) {
-      h.target = null;
-      if (!h.big && h.r > 0 && isFinite(h.cx) && isFinite(h.cy)) active.push(h);   // huge hunters wait until zoomed out
+      if (h.target && !alive.has(h.target)) h.target = null;
+      if (h.target) claimed.add(h.target);
     }
+    const active = hunters.filter(h => !h.big && h.r > 0 && isFinite(h.cx) && isFinite(h.cy));  // huge hunters wait until zoomed out
     if (!active.length || !circles.length) return;
     const elig = circles.filter(c => c !== held && c.r > 0);
     if (!elig.length) return;
     buildGrid(elig); if (grid) grid.list = elig;
-    const claimed = new Set();
-    // Hunters without a circle of their own stay still this frame (and try again next frame).
-    assignTargets(active, elig, claimed);
+    // Hunters without a target share out the unclaimed circles, closest pair first;
+    // any left without one stay still this frame and try again next frame.
+    const open = active.filter(h => !h.target);
+    if (open.length) assignTargets(open, elig, claimed);
     let popped = null;
     const born = [];
     for (const h of active) {
