@@ -24,6 +24,9 @@
   const HOLD_MS = 500;         // how long to hold before a circle appears
   const GROW_PX_PER_S = 160;   // how fast a circle's radius grows, in screen pixels
   const FORCE_HOLD_MS = 2000;  // two-finger hold that switches colour forces on or off
+  const DRAG_PX = 10;          // finger travel that turns a press into drawing a line
+  const LINE_WIDTH = 6;        // new lines' thickness, in screen pixels
+  const LINE_COLOR = '#FFFFFF';
 
   // ----- Colour -----
   // The background and every tapped circle each have their own hue, and no two
@@ -65,6 +68,36 @@
   // frame, so their edges stay sharp however far you zoom in.
   const BIG = 2e6, SMALL = 1e6;
   const circles = [];  // {cx, cy, r, color, hue} or {big:true, ox, oy, nx, ny, r, color, hue}
+  // Lines: pts is a flat [x0, y0, x1, y1, ...] smoothed polyline in screen
+  // coordinates, w its thickness. raw holds the finger points while drawing.
+  const strokes = [];
+
+  // Smooth a flat point list with Chaikin corner-cutting, keeping both ends.
+  function smooth(raw, passes) {
+    let p = raw;
+    for (let n = 0; n < passes; n++) {
+      if (p.length < 6) break;
+      const q = [p[0], p[1]];
+      for (let i = 0; i + 3 < p.length; i += 2) {
+        const x0 = p[i], y0 = p[i + 1], x1 = p[i + 2], y1 = p[i + 3];
+        q.push(0.75 * x0 + 0.25 * x1, 0.75 * y0 + 0.25 * y1, 0.25 * x0 + 0.75 * x1, 0.25 * y0 + 0.75 * y1);
+      }
+      q.push(p[p.length - 2], p[p.length - 1]);
+      p = q;
+    }
+    return p;
+  }
+  function strokeBox(st) {
+    if (!st.box) {
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (let i = 0; i < st.pts.length; i += 2) {
+        const x = st.pts[i], y = st.pts[i + 1];
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      }
+      st.box = [x0, y0, x1, y1];
+    }
+    return st.box;
+  }
   let W = innerWidth, H = innerHeight;
   const canvas = document.getElementById('c');
   const ctx = canvas.getContext('2d');
@@ -93,6 +126,16 @@
       }
       if (c.vx) { const vx = c.vx, vy = c.vy; c.vx = vx * cos - vy * sin; c.vy = vx * sin + vy * cos; }
       c.r *= k;
+    }
+    for (const st of strokes) {
+      for (const arr of [st.pts, st.raw]) {
+        if (!arr) continue;
+        for (let i = 0; i < arr.length; i += 2) {
+          const x = arr[i] - px, y = arr[i + 1] - py;
+          arr[i] = px + x * cos - y * sin + dx; arr[i + 1] = py + x * sin + y * cos + dy;
+        }
+      }
+      st.w *= k; st.box = null;
     }
     normalise();
     dirty = true;
@@ -181,6 +224,32 @@
         }
       }
     }
+    collideLines(bodies);
+  }
+
+  // Keep circles on their side of every line: push out and bounce off.
+  function collideLines(bodies) {
+    for (const st of strokes) {
+      const p = st.pts, half = st.w / 2, [bx0, by0, bx1, by1] = strokeBox(st);
+      for (const c of bodies) {
+        const reach = c.r + half;
+        if (c.cx < bx0 - reach || c.cx > bx1 + reach || c.cy < by0 - reach || c.cy > by1 + reach) continue;
+        for (let i = 0; i + 3 < p.length; i += 2) {
+          const ax = p[i], ay = p[i + 1], ex = p[i + 2] - ax, ey = p[i + 3] - ay;
+          const len2 = ex * ex + ey * ey;
+          let t = len2 ? ((c.cx - ax) * ex + (c.cy - ay) * ey) / len2 : 0;
+          t = t < 0 ? 0 : t > 1 ? 1 : t;
+          const qx = ax + ex * t, qy = ay + ey * t;
+          let nx = c.cx - qx, ny = c.cy - qy, d = Math.hypot(nx, ny);
+          if (d >= reach) continue;
+          if (d === 0) { nx = -ey; ny = ex; d = Math.hypot(nx, ny) || 1; }
+          nx /= d; ny /= d;
+          c.cx = qx + nx * reach; c.cy = qy + ny * reach;
+          const vn = (c.vx || 0) * nx + (c.vy || 0) * ny;
+          if (vn < 0) { c.vx -= (1 + RESTITUTION) * vn * nx; c.vy -= (1 + RESTITUTION) * vn * ny; }
+        }
+      }
+    }
   }
 
   const toastEl = document.getElementById('toast');
@@ -201,7 +270,11 @@
     now = now || performance.now();
     const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
     if (forcesOn && dt > 0) {
-      const steps = 3;
+      // Enough sub-steps that no circle moves more than a third of its radius
+      // per step, so circles can't tunnel through a line.
+      let worst = 0;
+      for (const c of circles) if (!c.big && c.r > 0 && c.vx) worst = Math.max(worst, Math.hypot(c.vx, c.vy) * dt / c.r);
+      const steps = Math.min(60, Math.max(3, Math.ceil(worst * 3)));
       for (let i = 0; i < steps; i++) stepForces(dt / steps);
       normalise();
       dirty = true;
@@ -232,8 +305,46 @@
           ctx.closePath(); ctx.fill();
         }
       }
+      ctx.strokeStyle = LINE_COLOR; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      for (const st of strokes) {
+        const p = st.pts, [x0, y0, x1, y1] = strokeBox(st), m = st.w;
+        if (x1 < -m || y1 < -m || x0 > W + m || y0 > H + m || p.length < 2) continue;
+        ctx.lineWidth = st.w;
+        ctx.beginPath();
+        if (p.length === 2) { ctx.moveTo(p[0], p[1]); ctx.lineTo(p[0] + 0.01, p[1]); }
+        else {
+          // Skip segments far off screen so huge zooms stay safe to draw.
+          let pen = false;
+          for (let i = 0; i + 3 < p.length; i += 2) {
+            const ax = p[i], ay = p[i + 1], bx = p[i + 2], by = p[i + 3];
+            const off = (ax < -m && bx < -m) || (ay < -m && by < -m) || (ax > W + m && bx > W + m) || (ay > H + m && by > H + m);
+            if (off) { pen = false; continue; }
+            const far = Math.max(Math.abs(ax), Math.abs(ay), Math.abs(bx), Math.abs(by)) > 1e7;
+            if (far) {
+              // Clip a very long segment to a box around the screen before drawing it.
+              const c = clipSeg(ax, ay, bx, by, -m - 10, -m - 10, W + m + 10, H + m + 10);
+              if (!c) { pen = false; continue; }
+              ctx.moveTo(c[0], c[1]); ctx.lineTo(c[2], c[3]); pen = false; continue;
+            }
+            if (!pen) { ctx.moveTo(ax, ay); pen = true; }
+            ctx.lineTo(bx, by);
+          }
+        }
+        ctx.stroke();
+      }
     }
     requestAnimationFrame(draw);
+  }
+  // Liang–Barsky: the part of segment (ax,ay)-(bx,by) inside a rectangle, or null.
+  function clipSeg(ax, ay, bx, by, x0, y0, x1, y1) {
+    let t0 = 0, t1 = 1; const dx = bx - ax, dy = by - ay;
+    for (const [p, q] of [[-dx, ax - x0], [dx, x1 - ax], [-dy, ay - y0], [dy, y1 - ay]]) {
+      if (p === 0) { if (q < 0) return null; continue; }
+      const r = q / p;
+      if (p < 0) { if (r > t1) return null; if (r > t0) t0 = r; }
+      else { if (r < t0) return null; if (r < t1) t1 = r; }
+    }
+    return [ax + dx * t0, ay + dy * t0, ax + dx * t1, ay + dy * t1];
   }
   addEventListener('resize', resize);
   resize();
@@ -258,11 +369,33 @@
   }
   function beginPress(id, x, y) {
     if (press) return;
-    press = { id, x, y, circle: null };
+    press = { id, x, y, x0: x, y0: y, circle: null, stroke: null };
     press.timer = setTimeout(startCircle, HOLD_MS);
   }
+  // Dragging before the hold kicks in draws a line instead.
   function movePress(id, x, y) {
-    if (press && id === press.id && !press.circle) { press.x = x; press.y = y; }
+    if (!press || id !== press.id || press.circle) return;
+    press.x = x; press.y = y;
+    if (!press.stroke) {
+      if (Math.hypot(x - press.x0, y - press.y0) < DRAG_PX) return;
+      clearTimeout(press.timer);
+      press.stroke = { raw: [press.x0, press.y0], pts: [press.x0, press.y0], w: LINE_WIDTH, box: null };
+      strokes.push(press.stroke);
+    }
+    const st = press.stroke, r = st.raw;
+    if (Math.hypot(x - r[r.length - 2], y - r[r.length - 1]) < 3) return;
+    r.push(x, y);
+    st.pts = smooth(r, 3); st.box = null;
+    dirty = true;
+  }
+  function finishStroke(st, keep) {
+    const r = st.raw;
+    let len = 0;
+    for (let i = 0; i + 3 < r.length; i += 2) len += Math.hypot(r[i + 2] - r[i], r[i + 3] - r[i + 1]);
+    if (!keep && len < 40) strokes.splice(strokes.indexOf(st), 1);  // a stray start of a pinch
+    else { st.pts = smooth(r, 3); st.box = null; }
+    delete st.raw;
+    dirty = true;
   }
   // The top-most circle under a screen point, if any.
   function circleAt(x, y) {
@@ -290,7 +423,8 @@
     if (!press) return;
     clearTimeout(press.timer);
     cancelAnimationFrame(press.raf);
-    if (!press.circle && tap) handleTap(press.x, press.y);
+    if (press.stroke) finishStroke(press.stroke, tap);
+    else if (!press.circle && tap) handleTap(press.x, press.y);
     press = null;
   }
 
@@ -368,7 +502,7 @@
   document.addEventListener('contextmenu', (e) => e.preventDefault());
 
   // For testing: window.__hue exposes state.
-  window.__hue = { circles, transformAll, get hue() { return hue; }, get forcesOn() { return forcesOn; } };
+  window.__hue = { circles, strokes, transformAll, get hue() { return hue; }, get forcesOn() { return forcesOn; } };
 </script>
 </body>
 </html>
