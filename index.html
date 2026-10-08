@@ -12,13 +12,18 @@
     -webkit-tap-highlight-color:transparent;-webkit-touch-callout:none;user-select:none;-webkit-user-select:none}
   body{background:hsl(170,70%,55%);transition:background-color .35s ease;cursor:pointer}
   canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #toast{position:fixed;left:50%;bottom:calc(28px + env(safe-area-inset-bottom));transform:translateX(-50%);
+    font:600 15px/1 -apple-system,system-ui,sans-serif;color:#fff;background:rgba(0,0,0,.45);padding:10px 16px;
+    border-radius:20px;opacity:0;transition:opacity .4s;pointer-events:none}
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
+<div id="toast"></div>
 <script>
   const HOLD_MS = 500;         // how long to hold before a circle appears
   const GROW_PX_PER_S = 160;   // how fast a circle's radius grows, in screen pixels
+  const FORCE_HOLD_MS = 2000;  // two-finger hold that switches colour forces on or off
 
   // ----- Colour -----
   // The background and every tapped circle each have their own hue, and no two
@@ -86,6 +91,7 @@
         const x = c.cx - px, y = c.cy - py;
         c.cx = px + x * cos - y * sin + dx; c.cy = py + x * sin + y * cos + dy;
       }
+      if (c.vx) { const vx = c.vx, vy = c.vy; c.vx = vx * cos - vy * sin; c.vy = vx * sin + vy * cos; }
       c.r *= k;
     }
     normalise();
@@ -120,8 +126,86 @@
     }
   }
 
+  // ----- Colour forces -----
+  // Each pair of coloured circles pulls or pushes by how far apart their hues are:
+  // opposite hues (180° apart) attract most, neighbouring hues repel most, and
+  // hues 90° apart ignore each other. White circles have no hue and feel nothing.
+  // Bigger circles pull harder. The rule scales with zoom, so it looks the same
+  // at any zoom level. Circles bump rather than overlap.
+  const G = 6;              // overall strength
+  const DAMPING = 1.2;      // friction, per second
+  const RESTITUTION = 0.3;  // bounciness when circles touch
+  let forcesOn = false;
+  let lastT = performance.now();
+
+  function stepForces(dt) {
+    const bodies = circles.filter(c => !c.big && c.r > 0 && !(press && press.circle === c));
+    for (const c of bodies) { c.vx = c.vx || 0; c.vy = c.vy || 0; c.ax = 0; c.ay = 0; }
+    for (let i = 0; i < bodies.length; i++) {
+      const a = bodies[i];
+      for (let j = i + 1; j < bodies.length; j++) {
+        const b = bodies[j];
+        let dx = b.cx - a.cx, dy = b.cy - a.cy;
+        let d = Math.hypot(dx, dy);
+        if (d === 0) { dx = 1e-6 * (a.r + b.r); dy = 0; d = Math.abs(dx); }
+        const ux = dx / d, uy = dy / d;
+        if (a.hue != null && b.hue != null) {
+          const pull = -Math.cos(hueGap(a.hue, b.hue) * Math.PI / 180); // +1 attract … -1 repel
+          const soft = Math.max(d, a.r + b.r);   // no runaway force once touching
+          const k = G * pull / soft;              // 2D gravity: acceleration ~ mass / distance
+          a.ax += ux * k * b.r * b.r; a.ay += uy * k * b.r * b.r;
+          b.ax -= ux * k * a.r * a.r; b.ay -= uy * k * a.r * a.r;
+        }
+      }
+    }
+    const f = Math.exp(-DAMPING * dt);
+    for (const c of bodies) {
+      c.vx = (c.vx + c.ax * dt) * f; c.vy = (c.vy + c.ay * dt) * f;
+      c.cx += c.vx * dt; c.cy += c.vy * dt;
+    }
+    // Collisions: push overlapping circles apart and soak up the impact.
+    for (let i = 0; i < bodies.length; i++) {
+      const a = bodies[i];
+      for (let j = i + 1; j < bodies.length; j++) {
+        const b = bodies[j];
+        const dx = b.cx - a.cx, dy = b.cy - a.cy, d = Math.hypot(dx, dy), min = a.r + b.r;
+        if (d >= min || d === 0) continue;
+        const ux = dx / d, uy = dy / d, ma = a.r * a.r, mb = b.r * b.r, overlap = min - d;
+        a.cx -= ux * overlap * mb / (ma + mb); a.cy -= uy * overlap * mb / (ma + mb);
+        b.cx += ux * overlap * ma / (ma + mb); b.cy += uy * overlap * ma / (ma + mb);
+        const rel = (b.vx - a.vx) * ux + (b.vy - a.vy) * uy;
+        if (rel < 0) {
+          const jimp = -(1 + RESTITUTION) * rel / (1 / ma + 1 / mb);
+          a.vx -= jimp / ma * ux; a.vy -= jimp / ma * uy;
+          b.vx += jimp / mb * ux; b.vy += jimp / mb * uy;
+        }
+      }
+    }
+  }
+
+  const toastEl = document.getElementById('toast');
+  let toastTimer = null;
+  function toast(text) {
+    toastEl.textContent = text; toastEl.style.opacity = '1';
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => toastEl.style.opacity = '0', 1400);
+  }
+  function toggleForces() {
+    forcesOn = !forcesOn;
+    if (!forcesOn) for (const c of circles) { c.vx = 0; c.vy = 0; }
+    toast(forcesOn ? 'Colour forces on' : 'Colour forces off');
+    if (navigator.vibrate) navigator.vibrate([20, 60, 20]);
+  }
+
   let dirty = true;
-  function draw() {
+  function draw(now) {
+    now = now || performance.now();
+    const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
+    if (forcesOn && dt > 0) {
+      const steps = 3;
+      for (let i = 0; i < steps; i++) stepForces(dt / steps);
+      normalise();
+      dirty = true;
+    }
     if (dirty) {
       dirty = false;
       ctx.clearRect(0, 0, W, H);
@@ -214,6 +298,7 @@
   const touches = new Map(); // id -> {x, y}
   let pinch = null;          // {d, a, mx, my} from the previous frame
   let gestureUsed = false;   // true once a pinch happened, until every finger is up
+  let twoHold = null;        // {timer, start} while two fingers rest still
   const pts = () => [...touches.values()];
   function pinchState() {
     const [a, b] = pts();
@@ -232,6 +317,10 @@
       endPress(false);          // a second finger means zoom, not a tap or hold
       gestureUsed = true;
       pinch = pinchState();
+      cancelTwoHold();
+      if (touches.size === 2) {
+        twoHold = { start: pinch, timer: setTimeout(() => { twoHold = null; toggleForces(); }, FORCE_HOLD_MS) };
+      }
     }
   }, opts);
   document.addEventListener('touchmove', (e) => {
@@ -246,9 +335,16 @@
       if (da > Math.PI) da -= 2 * Math.PI; else if (da < -Math.PI) da += 2 * Math.PI;
       transformAll(now.d / pinch.d, pinch.mx, pinch.my, now.mx - pinch.mx, now.my - pinch.my, da);
       pinch = now;
+      if (twoHold) {             // moving the fingers means pinching, not holding
+        const s0 = twoHold.start;
+        let turn = Math.abs(now.a - s0.a); if (turn > Math.PI) turn = 2 * Math.PI - turn;
+        if (Math.abs(now.d - s0.d) > 14 || Math.hypot(now.mx - s0.mx, now.my - s0.my) > 14 || turn > 0.12) cancelTwoHold();
+      }
     }
   }, opts);
+  function cancelTwoHold() { if (twoHold) { clearTimeout(twoHold.timer); twoHold = null; } }
   function liftTouches(e, cancelled) {
+    cancelTwoHold();
     for (const t of e.changedTouches) {
       touches.delete(t.identifier);
       if (press && press.id === t.identifier) endPress(!cancelled && !gestureUsed);
@@ -272,7 +368,7 @@
   document.addEventListener('contextmenu', (e) => e.preventDefault());
 
   // For testing: window.__hue exposes state.
-  window.__hue = { circles, transformAll, get hue() { return hue; } };
+  window.__hue = { circles, transformAll, get hue() { return hue; }, get forcesOn() { return forcesOn; } };
 </script>
 </body>
 </html>
