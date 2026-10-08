@@ -21,27 +21,36 @@
   const GROW_PX_PER_S = 160;   // how fast a circle's radius grows, in screen pixels
 
   // ----- Colour -----
-  // Circle colours. The background is never allowed near these two hues.
-  const RED = '#E53935';   // hue about 1
-  const BLUE = '#1E5BFF';  // hue about 224
+  // The background and every tapped circle each have their own hue, and no two
+  // ever share one. New circles start white (no hue) until they're tapped.
   const WHITE = '#FFFFFF';
-  const DOUBLE_TAP_MS = 350;
-  const allowedHue = (h) => !(h >= 335 || h <= 25) && !(h >= 195 && h <= 255);
-  function randomAllowedHue(avoid) {
-    for (;;) {
-      const h = Math.floor(Math.random() * 360);
-      const gap = avoid == null ? 180 : Math.min(Math.abs(h - avoid), 360 - Math.abs(h - avoid));
-      if (allowedHue(h) && gap >= 40) return h;
+  const hsl = (h) => `hsl(${h},70%,55%)`;
+  const hueGap = (a, b) => { const d = Math.abs(a - b) % 360; return Math.min(d, 360 - d); };
+  // Pick a new whole-degree hue: at least `far` degrees from the hues in `farFrom`
+  // (so the change is easy to see) and as far as possible from the hues in
+  // `taken`, never equal to any of them. Constraints relax only if the screen is crowded.
+  function pickHue(taken, farFrom) {
+    for (const far of [40, 25, 10, 1]) {
+      for (let gap = 20; gap >= 1; gap = gap > 1 ? Math.ceil(gap / 2) : 0) {
+        const ok = [];
+        for (let h = 0; h < 360; h++)
+          if (farFrom.every(f => hueGap(h, f) >= far) && taken.every(t => hueGap(h, t) >= gap)) ok.push(h);
+        if (ok.length) return ok[Math.floor(Math.random() * ok.length)];
+      }
     }
+    return null; // all 360 hues are in use
   }
-  let hue = randomAllowedHue(null);
+  const circleHues = (except) => circles.filter(c => c !== except && c.hue != null).map(c => c.hue);
+  let hue = Math.floor(Math.random() * 360);
   const theme = document.querySelector('meta[name=theme-color]');
   function paint() {
-    const c = `hsl(${hue},70%,55%)`;
-    document.body.style.backgroundColor = c;
-    theme.setAttribute('content', c);
+    document.body.style.backgroundColor = hsl(hue);
+    theme.setAttribute('content', hsl(hue));
   }
-  function nextHue() { hue = randomAllowedHue(hue); paint(); }
+  function nextHue() {
+    const h = pickHue(circleHues(null), [hue]);
+    if (h != null) { hue = h; paint(); }
+  }
   paint();
 
   // ----- Circles, stored in screen coordinates so zoom has no limits -----
@@ -50,7 +59,7 @@
   // nearest the screen, plus the direction to the centre", re-anchored every
   // frame, so their edges stay sharp however far you zoom in.
   const BIG = 2e6, SMALL = 1e6;
-  const circles = [];  // {cx, cy, r, color} or {big:true, ox, oy, nx, ny, r, color}
+  const circles = [];  // {cx, cy, r, color, hue} or {big:true, ox, oy, nx, ny, r, color, hue}
   let W = innerWidth, H = innerHeight;
   const canvas = document.getElementById('c');
   const ctx = canvas.getContext('2d');
@@ -182,17 +191,14 @@
     }
     return null;
   }
-  // Tap on a circle: once turns it red, twice quickly turns it blue.
-  // Tap on the background: change the background colour.
-  let lastTap = null; // {circle, t}
+  // Tap on a circle: give it a new hue. Tap on the background: change the background's hue.
   function handleTap(x, y) {
-    const hit = circleAt(x, y), now = performance.now();
-    if (!hit) { lastTap = null; nextHue(); return; }
-    if (lastTap && lastTap.circle === hit && now - lastTap.t < DOUBLE_TAP_MS) {
-      hit.color = BLUE; lastTap = null;
-    } else {
-      hit.color = RED; lastTap = { circle: hit, t: now };
-    }
+    const hit = circleAt(x, y);
+    if (!hit) { nextHue(); return; }
+    const far = hit.hue == null ? [hue] : [hue, hit.hue];
+    const h = pickHue([...circleHues(hit), hue], far);
+    if (h == null) return;
+    hit.hue = h; hit.color = hsl(h);
     dirty = true;
   }
   // Ends the press. A circle that was growing stops and stays on screen.
@@ -266,7 +272,7 @@
   document.addEventListener('contextmenu', (e) => e.preventDefault());
 
   // For testing: window.__hue exposes state.
-  window.__hue = { circles, transformAll };
+  window.__hue = { circles, transformAll, get hue() { return hue; } };
 </script>
 </body>
 </html>
