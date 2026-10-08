@@ -17,7 +17,7 @@
     border-radius:20px;opacity:0;transition:opacity .4s;pointer-events:none}
   #score{position:fixed;left:50%;top:calc(14px + env(safe-area-inset-top));transform:translateX(-50%);
     font:600 14px/1 -apple-system,system-ui,sans-serif;color:#fff;opacity:.85;text-shadow:0 1px 3px rgba(0,0,0,.45);pointer-events:none;white-space:nowrap}
-  #over{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;color:#fff;pointer-events:none;
+  #over{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;color:#fff;pointer-events:none;white-space:nowrap;width:max-content;
     font:600 16px/1.4 -apple-system,system-ui,sans-serif;background:rgba(0,0,0,.5);padding:22px 30px;border-radius:22px;display:none}
   #over b{display:block;font-size:30px;margin-bottom:6px}
   #over small{display:block;margin-top:10px;font-size:14px;opacity:.85}
@@ -43,16 +43,23 @@
   const HUNTER_SPEED = 25;     // hunter radii per second, so it looks the same at any zoom
   const CHASER_R = 8;          // the blue dot in the top corner, and new chasers
   const CHASER_SPEED = 35;     // chaser radii per second: faster than hunters so they can catch them
+  const FLEE_RANGE = 12;       // hunters run from chasers closer than this many hunter radii
   const POP_S = 0.25;          // length of the pop animation
   const CLONE_EVERY = 20;      // a hunter clones itself every this many pops
   const EMIT_MEAN_S = 1.2;     // average time between circles from one dot while forces are on
-  const FRAME_BUDGET_MS = 12;
+  const FRAME_BUDGET_MS = 12;  // physics time per frame; beyond this the simulation slows rather than freezes
+  const SPAWN_HUNTER = 0.1;    // chance a black dot's emission is a hunter instead of a circle
+  const SPAWN_CHASER = 0.1;    // ... or a chaser
+  const EMIT_MIN = 0.6, EMIT_MAX = 1.6;   // emitted circles: this range times the dot's radius
+  const SPAWN_R = 0.8;         // spawned hunters and chasers: this fraction of the dot's radius
+  const CIRCLE_FLEE_ACCEL = 15;  // coloured circles run from hunters: hunter radii/s² at point-blank range
   const PLAYER_R = 12;         // the white player dot's starting radius, in screen pixels
   const TILT_DEAD = 3;         // degrees of tilt that do nothing
   const TILT_FULL = 30;        // degrees of tilt for full speed
-  const TILT_MAX_SPEED = 450;  // screen pixels per second
+  const TILT_MAX_RADII = 37.5; // top speed in player start radii per second (450 px/s at normal zoom)
   const TILT_SMOOTH_S = 0.08;  // smoothing time constant for the player's speed
-  const INVULN_MS = 2000;      // blinking safe time after a restart  // physics time per frame; beyond this the simulation slows rather than freezes
+  const INVULN_MS = 2000;      // blinking safe time after a restart (longer while a bigger circle still covers the spot)
+  const NEUTRAL_MS = 300;      // tilt readings averaged for the neutral pose after load/restart
 
   // ----- Colour -----
   // The background and every tapped circle each have their own hue, and no two
@@ -96,6 +103,7 @@
   // circles while forces are on. wait = seconds until the next one.
   const dots = [];     // {cx, cy, r, wait} or the big form
   const emitWait = () => -Math.log(1 - Math.random()) * EMIT_MEAN_S;
+  const emitStats = { circle: 0, hunter: 0, chaser: 0 };   // what the dots have emitted (for tests)
   // Red hunters dragged out of the other corner: same small/big forms as circles.
   // Each one chases the nearest circle and pops it.
   const hunters = [];  // {cx, cy, r} or the big form
@@ -103,11 +111,15 @@
   // Blue chasers dragged out of the top corner: they go after hunters.
   const chasers = [];  // {cx, cy, r} or the big form
   // The player: a white dot pinned to the screen centre. Tilting moves the world
-  // the other way, so the dot seems to travel. It eats smaller circles and grows;
-  // bigger circles and hunters end the game. size = growth since the start
-  // (independent of zoom); invUntil = end of the blinking safe time.
+  // the other way, so the dot seems to travel. It never changes size (apart from
+  // zooming): eating a smaller circle scores a point, a hunter catching it costs 5,
+  // and a bigger circle covering it ends the game. invUntil = end of the blinking
+  // safe time after a restart; huntSafeUntil = end of the 1 s safe time after a catch.
   let playerOn = true;   // tests can switch the player off
-  const player = { cx: 0, cy: 0, r: PLAYER_R, eaten: 0, size: 1, over: false, invUntil: 0, vx: 0, vy: 0 };
+  // scale = zoom since the player (re)started, so its speed scales with zoom like a hunter's;
+  // guard = after a restart, stay safe until no bigger circle covers the player.
+  // size is always 1 (kept for anything reading the old field).
+  const player = { cx: 0, cy: 0, r: PLAYER_R, scale: 1, eaten: 0, score: 0, caught: 0, size: 1, over: false, invUntil: 0, guard: false, huntSafeUntil: 0, vx: 0, vy: 0 };
   const history = [];  // circles, lines, dots, hunters and chasers in the order they were made, for undo
   function undoLast() {
     while (history.length) {
@@ -202,7 +214,7 @@
       if (c.vx) { const vx = c.vx, vy = c.vy; c.vx = vx * cos - vy * sin; c.vy = vx * sin + vy * cos; }
       c.r *= k;
     }
-    player.r *= k;
+    player.r *= k; player.scale *= k;
     for (const st of strokes) {
       for (const arr of [st.pts, st.raw]) {
         if (!arr) continue;
@@ -258,18 +270,77 @@
   let forcesOn = false;
   let lastT = performance.now();
 
+  // Coloured circles run from hunters: each hunter within 6 circle radii + 10 hunter
+  // radii adds an acceleration away from it, strongest close up ((1 - d/R)²). It's
+  // an extra force in the normal physics, so damping, bumps, lines and permeability
+  // all still apply. Top speed (accel / damping) is about half a hunter's, so they
+  // can still be caught. Worked out once a frame over a grid of the hunters.
+  const fleeing = [];                 // circles with a flee acceleration this frame (fx, fy)
+  let fleeBuf = { cap: 0 };
+  function circleFlee() {
+    for (const c of fleeing) { c.fx = 0; c.fy = 0; }
+    fleeing.length = 0;
+    // Hunters copied to flat arrays: hunter objects come in many shapes, which makes
+    // reading their fields in the inner loop slow.
+    if (fleeBuf.cap < hunters.length) { const n = Math.max(64, hunters.length * 2); fleeBuf = { cap: n, x: new Float64Array(n), y: new Float64Array(n), r: new Float64Array(n) }; }
+    const HX = fleeBuf.x, HY = fleeBuf.y, HR = fleeBuf.r;
+    let n = 0, x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, maxR = 0;
+    for (const h of hunters) {
+      if (h.big || !(h.r > 0) || !isFinite(h.cx) || !isFinite(h.cy) || !isFinite(h.r)) continue;
+      const x = h.cx, y = h.cy; HX[n] = x; HY[n] = y; HR[n] = h.r; n++;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      if (h.r > maxR) maxR = h.r;
+    }
+    if (!n) return;
+    let cs = 20 * maxR;
+    while (((x1 - x0) / cs + 1) * ((y1 - y0) / cs + 1) > 4096) cs *= 2;
+    const nx = Math.floor((x1 - x0) / cs) + 1, ny = Math.floor((y1 - y0) / cs) + 1, cells = new Array(nx * ny);
+    for (let k = 0; k < n; k++) {
+      const i = Math.floor((HX[k] - x0) / cs) + nx * Math.floor((HY[k] - y0) / cs);
+      (cells[i] || (cells[i] = [])).push(k);
+    }
+    const allIdx = []; for (let k = 0; k < n; k++) allIdx.push(k);
+    const held = press && press.circle, A = CIRCLE_FLEE_ACCEL;
+    for (const c of circles) {
+      if (c.big || c.hue == null || !(c.r > 0) || c === held || !isFinite(c.r)) continue;   // white circles don't run
+      const cx = c.cx, cy = c.cy, r6 = 6 * c.r, reach = r6 + 10 * maxR;
+      if (cx < x0 - reach || cx > x1 + reach || cy < y0 - reach || cy > y1 + reach) continue;
+      let ax = 0, ay = 0;
+      const ia = Math.max(0, Math.floor((cx - reach - x0) / cs)), ib = Math.min(nx - 1, Math.floor((cx + reach - x0) / cs));
+      const ja = Math.max(0, Math.floor((cy - reach - y0) / cs)), jb = Math.min(ny - 1, Math.floor((cy + reach - y0) / cs));
+      const all = (ib - ia + 1) * (jb - ja + 1) > n;           // fewer hunters than cells: check them all
+      for (let j = all ? 0 : ja; j <= (all ? 0 : jb); j++) for (let i = all ? 0 : ia; i <= (all ? 0 : ib); i++) {
+        const list = all ? allIdx : cells[i + nx * j];
+        if (!list) continue;
+        for (let m = 0; m < list.length; m++) {
+          const k = list[m], R = r6 + 10 * HR[k], dx = cx - HX[k], dy = cy - HY[k];
+          if (!(dx < R && dx > -R && dy < R && dy > -R)) continue;
+          const d2 = dx * dx + dy * dy;
+          if (!(d2 < R * R)) continue;
+          const d = Math.sqrt(d2), q = 1 - d / R, f = A * HR[k] * q * q;
+          if (d > 0) { ax += dx / d * f; ay += dy / d * f; }
+          else { const t = Math.random() * Math.PI * 2; ax += Math.cos(t) * f; ay += Math.sin(t) * f; }
+        }
+      }
+      if (ax || ay) { c.fx = ax; c.fy = ay; fleeing.push(c); }
+    }
+  }
+
   const bodies = [], coloured = [];   // reused every step, no per-step garbage
   const BUF_KEYS = ['x', 'y', 'r', 'hc', 'hs', 'ax', 'ay'], buf = { cap: 0 };
-  function stepForces(dt) {
+  // pull = colour forces on. With them off the step still runs while circles are
+  // fleeing or coasting: only moving circles move, but they bump into resting ones.
+  function stepForces(dt, pull = true) {
     bodies.length = 0; coloured.length = 0;
     for (const c of circles) {
       if (c.big || !(c.r > 0) || (press && press.circle === c)) continue;
-      c.vx = c.vx || 0; c.vy = c.vy || 0; c.ax = 0; c.ay = 0;
+      c.vx = c.vx || 0; c.vy = c.vy || 0; c.ax = c.fx || 0; c.ay = c.fy || 0;
+      c.awake = pull || c.vx !== 0 || c.vy !== 0 || c.ax !== 0 || c.ay !== 0;
       // Solidity = 1 - permeability: a circle the background's colour lets others
       // pass straight through it; the opposite colour is fully solid. White is solid.
       c.solid = c.hue == null ? 1 : hueGap(c.hue, hue) / 180;
       bodies.push(c);
-      if (c.hue != null) {
+      if (pull && c.hue != null) {
         const t = c.hue * Math.PI / 180; c.hc = Math.cos(t); c.hs = Math.sin(t);  // cos(gap) = hc·hc' + hs·hs'
         coloured.push(c);
       }
@@ -296,7 +367,7 @@
       }
       AX[i] += fax; AY[i] += fay;
     }
-    for (let i = 0; i < n; i++) { coloured[i].ax = AX[i]; coloured[i].ay = AY[i]; }
+    for (let i = 0; i < n; i++) { coloured[i].ax += AX[i]; coloured[i].ay += AY[i]; }
     const f = Math.exp(-DAMPING * dt);
     for (const c of bodies) {
       c.vx = (c.vx + c.ax * dt) * f; c.vy = (c.vy + c.ay * dt) * f;
@@ -312,6 +383,7 @@
       for (let j = i + 1; j < m; j++) {
         const b = bodies[j];
         if (b.lx > right) break;
+        if (!a.awake && !b.awake) continue;     // two resting circles stay as they are
         const sol = a.solid * b.solid;
         if (sol <= 0) continue;                   // fully permeable: they pass through each other
         const dx = b.cx - a.cx, dy = b.cy - a.cy, min = a.r + b.r;
@@ -335,10 +407,19 @@
           a.vx += ja * ux; a.vy += ja * uy;
           b.vx -= jb * ux; b.vy -= jb * uy;
         }
+        a.awake = b.awake = true;
       }
     }
-    collideLines(bodies);
+    if (pull) collideLines(bodies);
+    else {
+      awakeList.length = 0;
+      for (const c of bodies) if (c.awake) awakeList.push(c);
+      collideLines(awakeList);
+      // With colour forces off, a circle that has nearly stopped and isn't fleeing comes to rest.
+      for (const c of awakeList) if (!c.fx && !c.fy && c.vx * c.vx + c.vy * c.vy < (0.05 * c.r) ** 2) { c.vx = 0; c.vy = 0; }
+    }
   }
+  const awakeList = [];
 
   // Keep circles on their side of every line: push out and bounce off.
   function collideLines(bodies) {
@@ -390,11 +471,25 @@
       d.wait = emitWait();
       const ok = d.big ? isFinite(d.ox) && isFinite(d.oy) : isFinite(d.cx) && isFinite(d.cy);
       if (!ok || !isFinite(d.r)) continue;          // only if the view itself has overflowed
+      const roll = Math.random();
+      if (roll < SPAWN_HUNTER + SPAWN_CHASER) {
+        // Now and then a hunter or chaser instead, 0.8x the dot's size, at the dot.
+        const kind = roll < SPAWN_HUNTER ? 'hunter' : 'chaser', r = d.r * SPAWN_R;
+        const o = d.big
+          ? { big: true, ox: d.ox + d.nx * (d.r - r), oy: d.oy + d.ny * (d.r - r), nx: d.nx, ny: d.ny, r }   // same centre as the dot
+          : { cx: d.cx, cy: d.cy, r };
+        if (kind === 'hunter') { o.popCount = 0; hunters.push(o); } else chasers.push(o);
+        history.push({ type: kind, obj: o });
+        emitStats[kind]++;
+        continue;
+      }
+      emitStats.circle++;
       const h = Math.floor(Math.random() * 360);   // any hue, the background's included
       const a = Math.random() * Math.PI * 2, v = d.r * (1.5 + Math.random() * 2);
+      const r = d.r * (EMIT_MIN + Math.random() * (EMIT_MAX - EMIT_MIN));   // mixed sizes: some bigger than a new player
       const c = d.big
-        ? { big: true, ox: d.ox, oy: d.oy, nx: d.nx, ny: d.ny, r: d.r }   // huge: same edge-anchored form as the dot
-        : { cx: d.cx + Math.cos(a) * d.r * 0.05, cy: d.cy + Math.sin(a) * d.r * 0.05, r: d.r };
+        ? { big: true, ox: d.ox + d.nx * (d.r - r), oy: d.oy + d.ny * (d.r - r), nx: d.nx, ny: d.ny, r }   // huge: centred on the dot
+        : { cx: d.cx + Math.cos(a) * d.r * 0.05, cy: d.cy + Math.sin(a) * d.r * 0.05, r };
       c.hue = h; c.color = hsl(h); c.vx = Math.cos(a) * v; c.vy = Math.sin(a) * v;
       circles.push(c);
       history.push({ type: 'circle', obj: c });
@@ -603,9 +698,11 @@
     while (open.length && claimed.size < elig.length) {
       const pairs = [], listers = new Map();
       for (const h of open) {
-        const { gs, cs } = kNearest(h, elig, claimed, HUNT_K);
-        h._left = gs.length; h._kgap = gs.length === HUNT_K ? gs[HUNT_K - 1] : Infinity;
-        for (let i = 0; i < gs.length; i++) {
+        // A hunter only takes circles nearer than its limit (the player, for hunters).
+        const { gs, cs } = kNearest(h, elig, claimed, HUNT_K), lim = h._lim === undefined ? Infinity : h._lim;
+        let n = 0; while (n < gs.length && gs[n] < lim) n++;
+        h._left = n; h._kgap = gs.length === HUNT_K && gs[HUNT_K - 1] < lim ? gs[HUNT_K - 1] : Infinity;
+        for (let i = 0; i < n; i++) {
           pairs.push({ g: gs[i], h, c: cs[i] });
           const l = listers.get(cs[i]); if (l) l.push(h); else listers.set(cs[i], [h]);
         }
@@ -625,60 +722,121 @@
   }
   function nearestFree(h, elig, skip) { const { cs } = kNearest(h, elig, skip, 1); return cs[0] || null; }
 
+  // Threat from nearby chasers: each one within FLEE_RANGE hunter radii pushes the
+  // hunter away, weighted 1 - d/range; _fw is the closest one's weight (0 = safe)
+  // and (_fx, _fy) the direction to run.
+  function fleeOf(h) {
+    const range = FLEE_RANGE * h.r;
+    let fx = 0, fy = 0, w = 0;
+    for (const c of chasers) {
+      if (c.big || !(c.r > 0)) continue;
+      const dx = h.cx - c.cx, dy = h.cy - c.cy;
+      if (!(Math.abs(dx) < range && Math.abs(dy) < range)) continue;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (!(d < range)) continue;
+      const wt = 1 - d / range;
+      if (d > 0) { fx += dx / d * wt; fy += dy / d * wt; }
+      else { const a = Math.random() * Math.PI * 2; fx += Math.cos(a) * wt; fy += Math.sin(a) * wt; }   // right on top: any way
+      if (wt > w) w = wt;
+    }
+    h._fw = Math.min(1, w);
+    if (w > 0) {
+      let L = Math.hypot(fx, fy);
+      if (!(L > 1e-9 * w)) { const a = Math.random() * Math.PI * 2; fx = Math.cos(a); fy = Math.sin(a); L = 1; }   // threats cancel out
+      h._fx = fx / L; h._fy = fy / L;
+    }
+  }
   function huntStep(dt, now) {
     if (!hunters.length) return;
     const held = press && press.circle;
-    // Targets are sticky: a hunter keeps its circle until it pops it. It only loses
-    // it if the circle disappears some other way (eaten, undone), and then looks again.
-    // The player is one more target, while it can be caught.
+    // Circle targets are unique and sticky: a hunter keeps its circle until it pops
+    // it, and only loses it if the circle disappears some other way (eaten, undone).
+    // The player is different: any number of hunters may chase it, and a hunter
+    // always goes for the player when the player is nearer than its circle.
     const prey = playerLive() && !invulnerable(now) ? player : null;
     const alive = new Set(circles), claimed = new Set();
-    if (prey) alive.add(prey);
     for (const h of hunters) {
+      if (h.target === player) { if (!prey) h.target = null; continue; }   // dead, safe or off: rejoin the circles
       if (h.target && !alive.has(h.target)) h.target = null;
       if (h.target) claimed.add(h.target);
     }
     const active = hunters.filter(h => !h.big && h.r > 0 && isFinite(h.cx) && isFinite(h.cy));  // huge hunters wait until zoomed out
-    if (!active.length || (!circles.length && !prey)) return;
+    if (!active.length) return;
+    for (const h of active) fleeOf(h);
     const elig = circles.filter(c => c !== held && c.r > 0);
-    if (prey) elig.push(prey);
-    if (!elig.length) return;
-    buildGrid(elig); if (grid) grid.list = elig;
-    // Hunters without a target share out the unclaimed circles, closest pair first;
-    // any left without one stay still this frame and try again next frame.
-    const open = active.filter(h => !h.target);
-    if (open.length) assignTargets(open, elig, claimed);
+    // The one allowed mid-chase switch: the player is now nearer than the hunter's
+    // circle, so it goes for the player and lets the circle go.
+    if (prey) for (const h of active) {
+      h._pg = gapTo(h, player);
+      if (h.target && h.target !== player && h._pg < gapTo(h, h.target)) { claimed.delete(h.target); h.target = player; }
+    }
+    // Idle hunters and those on the player share out the unclaimed circles, closest
+    // pair first, but only take a circle nearer than the player (claimed circles are
+    // never stolen). Whoever is left goes for the player, or waits if it can't be caught.
+    const open = active.filter(h => !h.target || h.target === player);
+    for (const h of open) { h._lim = prey ? h._pg : Infinity; if (h.target === player) h.target = null; }
+    if (open.length && elig.length) {
+      buildGrid(elig); if (grid) grid.list = elig;
+      assignTargets(open, elig, claimed);
+    }
+    if (prey) for (const h of open) if (!h.target) h.target = player;
+    for (const h of open) h._lim = Infinity;
     let popped = null;
     const born = [];
+    // Touching its target: pop it. Returns true to stop moving this frame. Reaching
+    // the player just stops it there: catchStep (below) deals with the catch.
+    const hit = (h, tgt) => {
+      if (tgt === player) return true;
+      claimed.add(tgt); h.target = null;
+      (popped || (popped = new Set())).add(tgt);
+      if (!tgt.big) pops.push({ x: tgt.cx, y: tgt.cy, r: tgt.r, color: tgt.color, t0: now });
+      // Every 20th pop the hunter clones itself, 2.5 radii away in a random direction.
+      h.popCount = (h.popCount || 0) + 1;
+      if (h.popCount >= CLONE_EVERY) {
+        h.popCount = 0;
+        const a = Math.random() * Math.PI * 2;
+        const c = { cx: h.cx + Math.cos(a) * h.r * 2.5, cy: h.cy + Math.sin(a) * h.r * 2.5, r: h.r, popCount: 0 };
+        born.push(c);
+        pops.push({ x: c.cx, y: c.cy, r: c.r * 1.5, color: '#ff2a2a', t0: now });   // a quick red ring
+      }
+      return false;
+    };
     for (const h of active) {
       let step = HUNTER_SPEED * h.r * dt, tgt = h.target;
+      if (h._fw > 0) {
+        // A chaser is close: run. The heading blends from "towards the target" to
+        // "straight away from the chasers" as the nearest one gets closer; the
+        // target is kept, and is still popped if the hunter touches it.
+        const n = Math.min(8, Math.ceil(step / (0.5 * h.r)));
+        for (let i = 0; i < n; i++) {
+          let ux = h._fx, uy = h._fy;
+          if (tgt) {
+            gapTo(h, tgt);
+            const bx = (1 - h._fw) * gapDir.ux + h._fw * h._fx, by = (1 - h._fw) * gapDir.uy + h._fw * h._fy, L = Math.hypot(bx, by);
+            if (L > 1e-9) { ux = bx / L; uy = by / L; }
+          }
+          h.cx += ux * step / n; h.cy += uy * step / n;
+          if (tgt && gapTo(h, tgt) <= 0) { if (hit(h, tgt)) break; tgt = null; break; }
+        }
+        continue;
+      }
+      if (!tgt) continue;                                           // no unique target: stay put
       // Up to a few pops per frame if circles are packed tight; each move is a
       // straight line to the target's edge, so a fast hunter can't skip past it.
       for (let k = 0; k < 4 && step > 0; k++) {
         if (!tgt) {
-          if (k === 0) break;                                       // no unique target: stay put
-          tgt = nearestFree(h, elig, claimed);                      // after a pop: next unclaimed circle only
+          tgt = nearestFree(h, elig, claimed);                      // after a pop: next unclaimed circle only ...
+          if (prey && !player.over && (!tgt || gapTo(h, player) <= gapTo(h, tgt))) tgt = player;   // ... unless the player is nearer
           if (!tgt) break;
-          claimed.add(tgt);
+          if (tgt !== player) claimed.add(tgt);
         }
         h.target = tgt;
         const g = gapTo(h, tgt), ux = gapDir.ux, uy = gapDir.uy;
         if (g > step) { h.cx += ux * step; h.cy += uy * step; break; }
         const go = Math.max(0, g);
         h.cx += ux * go; h.cy += uy * go; step -= go;
-        if (tgt === player) { claimed.add(tgt); h.target = null; gameOver(now, '#ff2a2a'); break; }   // caught
-        (popped || (popped = new Set())).add(tgt); claimed.add(tgt);
-        if (!tgt.big) pops.push({ x: tgt.cx, y: tgt.cy, r: tgt.r, color: tgt.color, t0: now });
-        tgt = null; h.target = null;
-        // Every 20th pop the hunter clones itself, 2.5 radii away in a random direction.
-        h.popCount = (h.popCount || 0) + 1;
-        if (h.popCount >= CLONE_EVERY) {
-          h.popCount = 0;
-          const a = Math.random() * Math.PI * 2;
-          const c = { cx: h.cx + Math.cos(a) * h.r * 2.5, cy: h.cy + Math.sin(a) * h.r * 2.5, r: h.r, popCount: 0 };
-          born.push(c);
-          pops.push({ x: c.cx, y: c.cy, r: c.r * 1.5, color: '#ff2a2a', t0: now });   // a quick red ring
-        }
+        if (hit(h, tgt)) break;
+        tgt = null;
       }
     }
     for (const c of born) { hunters.push(c); history.push({ type: 'hunter', obj: c }); }
@@ -772,18 +930,30 @@
   const BLUE = '#2a7bff';
 
   // ----- Player -----
-  // Tilt: the first reading after load (and after each restart) is the neutral pose.
-  let neutral = null, tiltX = 0, tiltY = 0;   // tilt from neutral in screen axes, degrees
+  // Tilt: the readings in the first 0.3 s after load (and after each restart) are
+  // averaged into the neutral pose; until then the player stays put.
+  let neutral = null, calib = null, tiltX = 0, tiltY = 0;   // tilt from neutral in screen axes, degrees
   const keys = new Set();
   const wrap180 = (d) => ((d % 360) + 540) % 360 - 180;
   function onTilt(beta, gamma) {
     if (beta == null || gamma == null || !isFinite(beta) || !isFinite(gamma)) return;   // no sensor
-    if (!neutral) neutral = { beta, gamma };
+    if (!neutral) {
+      const now = performance.now();
+      if (!calib) calib = { t0: now, b0: beta, g0: gamma, sb: 0, sg: 0, n: 0 };
+      calib.sb += wrap180(beta - calib.b0); calib.sg += wrap180(gamma - calib.g0); calib.n++;
+      finishCalib(now);
+      if (!neutral) return;
+    }
     const tx = wrap180(gamma - neutral.gamma);   // right edge down: towards screen right (portrait)
     const ty = wrap180(beta - neutral.beta);     // top away from you: beta falls, towards screen top
     let ang = screen.orientation && typeof screen.orientation.angle === 'number' ? screen.orientation.angle : (window.orientation || 0);
     ang = ((Math.round(ang / 90) % 4) + 4) % 4;
     [tiltX, tiltY] = ang === 0 ? [tx, ty] : ang === 1 ? [ty, -tx] : ang === 2 ? [-tx, -ty] : [-ty, tx];
+  }
+  function finishCalib(now) {
+    if (!calib || now - calib.t0 < NEUTRAL_MS) return;
+    neutral = { beta: calib.b0 + calib.sb / calib.n, gamma: calib.g0 + calib.sg / calib.n };
+    calib = null;
   }
   addEventListener('deviceorientation', (e) => onTilt(e.beta, e.gamma));
   let askedTilt = false;
@@ -793,25 +963,27 @@
     if (D && typeof D.requestPermission === 'function') D.requestPermission().catch(() => {});
   }
   const playerLive = () => playerOn && !player.over && player.r >= 1e-6 && player.r <= BIG;   // paused at extreme zoom
-  const invulnerable = (now) => now < player.invUntil;
+  const invulnerable = (now) => now < player.invUntil || (player.guard && player.covered);
   // Move the world opposite to the tilt (or arrow keys), sliding the player along lines.
   const pBody = { cx: 0, cy: 0, r: 0, vx: 0, vy: 0 };
-  function movePlayer(dt) {
+  function movePlayer(dt, now) {
+    finishCalib(now);                  // in case the sensor only reports changes
     let vx = 0, vy = 0;
-    if (playerOn && !player.over) {
+    const MAX = TILT_MAX_RADII * PLAYER_R * player.scale;   // scales with zoom, not with growth
+    if (playerOn && !player.over && isFinite(MAX)) {
       const m = Math.hypot(tiltX, tiltY);
       if (m > TILT_DEAD) {
-        const sp = TILT_MAX_SPEED * Math.min(1, (m - TILT_DEAD) / (TILT_FULL - TILT_DEAD));
+        const sp = MAX * Math.min(1, (m - TILT_DEAD) / (TILT_FULL - TILT_DEAD));
         vx = tiltX / m * sp; vy = tiltY / m * sp;
       }
       const kx = (keys.has('right') ? 1 : 0) - (keys.has('left') ? 1 : 0), ky = (keys.has('down') ? 1 : 0) - (keys.has('up') ? 1 : 0);
-      if (kx || ky) { const L = Math.hypot(kx, ky); vx += kx / L * TILT_MAX_SPEED; vy += ky / L * TILT_MAX_SPEED; }
+      if (kx || ky) { const L = Math.hypot(kx, ky); vx += kx / L * MAX; vy += ky / L * MAX; }
       const v = Math.hypot(vx, vy);
-      if (v > TILT_MAX_SPEED) { vx *= TILT_MAX_SPEED / v; vy *= TILT_MAX_SPEED / v; }
+      if (v > MAX) { vx *= MAX / v; vy *= MAX / v; }
     }
     const f = 1 - Math.exp(-dt / TILT_SMOOTH_S);
     player.vx += (vx - player.vx) * f; player.vy += (vy - player.vy) * f;
-    if (!vx && !vy && Math.hypot(player.vx, player.vy) < 1) { player.vx = 0; player.vy = 0; }
+    if (!vx && !vy && !(Math.hypot(player.vx, player.vy) >= 1e-3 * MAX)) { player.vx = 0; player.vy = 0; }
     if (!playerOn || player.over || (!player.vx && !player.vy)) return;
     const mx = player.vx * dt, my = player.vy * dt, r = player.r;
     pBody.cx = W / 2; pBody.cy = H / 2; pBody.r = r;
@@ -841,8 +1013,7 @@
       if (d2 >= P * P) continue;
       const d = Math.sqrt(d2);
       if (d + c.r > P && lensFrac(P, c.r, d) <= 0.5) continue;
-      const g = Math.sqrt(1 + (c.r / P) ** 2);    // grow by area: r² + rc²
-      player.r = P * g; player.size *= g; player.eaten++;
+      player.eaten++; player.score++;             // a point per circle; the player doesn't grow
       (gone || (gone = new Set())).add(c);
       pops.push({ x: c.cx, y: c.cy, r: c.r, color: '#FFFFFF', t0: now });
     }
@@ -855,11 +1026,11 @@
       history.length = w;
       dirty = true;
     }
-    if (invulnerable(now)) return;
+    if (now < player.invUntil) return;       // the guard below decides after the first 2 s
     const P = player.r;
+    let killer = null, clone = null;
     for (const c of circles) {
       if (c === held || !(c.r > P * (1 + 1e-9))) continue;
-      let clone;
       if (c.big) {
         const t = (px - c.ox) * c.nx + (py - c.oy) * c.ny;
         if (!(t > 0)) continue;
@@ -875,40 +1046,62 @@
         if (d > 0) { ux = dx / d; uy = dy / d; } else { const a = Math.random() * Math.PI * 2; ux = Math.cos(a); uy = Math.sin(a); }
         clone = cloneOf(c, { cx: c.cx + ux * 2 * R, cy: c.cy + uy * 2 * R });
       }
-      circles.push(clone); history.push({ type: 'circle', obj: clone });
-      normalise();
-      gameOver(now, c.color || '#FFFFFF');
-      return;
+      killer = c; break;
     }
+    // Just restarted: the safe time lasts until no bigger circle covers the player,
+    // so a restart can never land straight back in a death.
+    if (player.guard) {
+      player.covered = !!killer;
+      if (killer) return;
+      player.guard = false;
+    }
+    if (!killer) return;
+    circles.push(clone); history.push({ type: 'circle', obj: clone });
+    normalise();
+    gameOver(now, killer.color || '#FFFFFF');
   }
-  // A hunter touching the player ends the game too.
+  // Any hunter touching the player catches it, whatever it was chasing: the hunter
+  // is destroyed, the player loses 5 points (never below 0) and is safe from
+  // hunters for 1 s. A catch never ends the game.
+  const CATCH_COST = 5, CATCH_SAFE_MS = 1000;
+  const huntSafe = (now) => now < player.huntSafeUntil;
   function catchStep(now) {
-    if (!playerLive() || invulnerable(now)) return;
+    if (!playerLive() || invulnerable(now) || huntSafe(now)) return;
     const px = W / 2, py = H / 2;
-    for (const h of hunters) {
+    for (let i = 0; i < hunters.length; i++) {
+      const h = hunters[i];
       if (h.big || !(h.r > 0)) continue;
-      if (Math.hypot(h.cx - px, h.cy - py) <= player.r + h.r) { gameOver(now, '#ff2a2a'); return; }
+      if (!(Math.hypot(h.cx - px, h.cy - py) <= (player.r + h.r) * (1 + 1e-9))) continue;
+      hunters.splice(i, 1);
+      const k = history.findIndex(it => it.obj === h); if (k >= 0) history.splice(k, 1);
+      pops.push({ x: h.cx, y: h.cy, r: h.r * 1.5, color: '#ff2a2a', t0: now });
+      player.score = Math.max(0, player.score - CATCH_COST); player.caught++;
+      player.huntSafeUntil = now + CATCH_SAFE_MS;
+      dirty = true;
+      if (navigator.vibrate) navigator.vibrate([30, 30, 30]);
+      return;
     }
   }
   const scoreEl = document.getElementById('score'), overEl = document.getElementById('over');
   let shownScore = null;
   function showScore() {
-    const t = playerOn ? 'Eaten ' + player.eaten : '';
+    const t = playerOn ? 'Score ' + player.score : '';
     if (t !== shownScore) { scoreEl.textContent = t; shownScore = t; }
   }
   function gameOver(now, color) {
     player.over = true; player.vx = 0; player.vy = 0;
     for (const h of hunters) if (h.target === player) h.target = null;
     pops.push({ x: W / 2, y: H / 2, r: Math.min(player.r, 4 * Math.hypot(W, H)) * 1.5, color, t0: now });
-    const size = player.size < 10 ? player.size.toFixed(1) : player.size < 1e6 ? Math.round(player.size) : player.size.toExponential(1);
-    document.getElementById('overScore').textContent = `Ate ${player.eaten} circle${player.eaten === 1 ? '' : 's'} · size ${size}×`;
+    document.getElementById('overScore').textContent =
+      `Score ${player.score} · ate ${player.eaten} · caught ${player.caught}×`;
     overEl.style.display = 'block';
     dirty = true;
     if (navigator.vibrate) navigator.vibrate([40, 40, 120]);
   }
   function restart() {
-    Object.assign(player, { r: PLAYER_R, eaten: 0, size: 1, over: false, vx: 0, vy: 0, invUntil: performance.now() + INVULN_MS });
-    neutral = null; tiltX = 0; tiltY = 0;       // the next reading is the new neutral pose
+    Object.assign(player, { r: PLAYER_R, scale: 1, eaten: 0, score: 0, caught: 0, size: 1, over: false, vx: 0, vy: 0, guard: true, covered: false, huntSafeUntil: 0,
+                            invUntil: performance.now() + INVULN_MS });
+    neutral = null; calib = null; tiltX = 0; tiltY = 0;   // the next 0.3 s of readings set the new neutral pose
     overEl.style.display = 'none';
     dirty = true;
   }
@@ -918,7 +1111,7 @@
     const p = { cx: W / 2, cy: H / 2, r: Math.max(player.r, 2) };   // never smaller than a speck on screen
     if (!(p.r < Infinity)) p.r = 4 * Math.hypot(W, H);
     ctx.save();
-    ctx.globalAlpha = player.over ? 0.45 : invulnerable(now) && Math.floor(now / 125) % 2 ? 0.25 : 1;
+    ctx.globalAlpha = player.over ? 0.45 : (invulnerable(now) || huntSafe(now)) && Math.floor(now / 125) % 2 ? 0.25 : 1;
     ctx.shadowColor = 'rgba(255,255,255,.95)'; ctx.shadowBlur = Math.min(14, p.r);
     ctx.fillStyle = '#FFFFFF';
     const ring = fillDisc(p) && p.r < 1e5;
@@ -934,8 +1127,12 @@
   function draw(now) {
     now = now || performance.now();
     const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
-    if (forcesOn && dt > 0) {
-      emit(dt);
+    const tFrame = performance.now();   // the physics budget includes working out who flees
+    if (dt > 0) circleFlee();
+    let coasting = forcesOn || fleeing.length > 0;
+    if (!coasting) for (const c of circles) if (c.vx || c.vy) { coasting = true; break; }
+    if (coasting && dt > 0) {
+      if (forcesOn) emit(dt);
       // Enough sub-steps that no circle moves more than a third of its radius
       // per step, so circles can't tunnel through a line.
       let worst = 0;
@@ -943,21 +1140,20 @@
       const steps = Math.min(60, Math.max(3, Math.ceil(worst * 3)));
       // With very many circles, stop when the frame's physics budget is spent:
       // the simulation runs slower instead of the screen freezing.
-      const t0 = performance.now();
       for (let i = 0; i < steps; i++) {
-        stepForces(dt / steps);
-        if (performance.now() - t0 > FRAME_BUDGET_MS) break;
+        stepForces(dt / steps, forcesOn);
+        if (performance.now() - tFrame > FRAME_BUDGET_MS) break;
       }
       normalise();
       dirty = true;
     }
     player.cx = W / 2; player.cy = H / 2;
-    if (dt > 0) movePlayer(dt);
+    if (dt > 0) movePlayer(dt, now);
     eatStep();
     playerStep(now);
     if (dt > 0) { huntStep(dt, now); chaseStep(dt, now); }
     catchStep(now);
-    if (playerOn && invulnerable(now)) dirty = true;   // blinking
+    if (playerOn && (invulnerable(now) || huntSafe(now))) dirty = true;   // blinking
     showScore();
     if (dirty) {
       dirty = false;
@@ -1288,10 +1484,13 @@
   // For testing: window.__hue exposes state.
   window.__hue = { circles, strokes, dots, hunters, chasers, pops, history, transformAll, get dock() { return { x: dockX, y: dockY, r: DOT_R }; },
     get redDock() { return { x: redX, y: redY, r: HUNTER_R }; }, get blueDock() { return { x: blueX, y: blueY, r: CHASER_R }; }, get hue() { return hue; }, set hue(h) { hue = h; paint(); }, get forcesOn() { return forcesOn; },
-    get player() { return { x: W / 2, y: H / 2, r: player.r, eaten: player.eaten, size: player.size, gameOver: player.over,
-      invulnerable: invulnerable(performance.now()), vx: player.vx, vy: player.vy, tilt: [tiltX, tiltY], on: playerOn }; },
+    get player() { return { x: W / 2, y: H / 2, r: player.r, eaten: player.eaten, score: player.score, caught: player.caught, size: player.size, gameOver: player.over,
+      invulnerable: invulnerable(performance.now()), huntSafe: huntSafe(performance.now()), guard: player.guard, scale: player.scale, vx: player.vx, vy: player.vy,
+      tilt: [tiltX, tiltY], neutral: neutral && [neutral.beta, neutral.gamma], on: playerOn }; },
+    emitStats,
     playerObj: player, setTilt: onTilt, restart,
     get playerOn() { return playerOn; }, set playerOn(v) { playerOn = !!v; dirty = true; overEl.style.display = playerOn && player.over ? 'block' : 'none'; } };
 </script>
+<script src="hud.js"></script>
 </body>
 </html>
