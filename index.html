@@ -54,8 +54,8 @@
     if (navigator.vibrate) navigator.vibrate(15);
   }
 
-  function endPress(e, cancelled) {
-    if (!press || e.pointerId !== press.id) return;
+  function endPress(id, cancelled) {
+    if (!press || id !== press.id) return;
     clearTimeout(press.timer);
     cancelAnimationFrame(press.raf);
     if (press.circle) {
@@ -69,18 +69,40 @@
     }
     press = null;
   }
-
-  document.addEventListener('pointerdown', (e) => {
+  function beginPress(id, x, y) {
     if (press) return;
-    document.body.setPointerCapture?.(e.pointerId);
-    press = { id: e.pointerId, x: e.clientX, y: e.clientY, circle: null };
+    press = { id, x, y, circle: null };
     press.timer = setTimeout(startCircle, HOLD_MS);
-  });
-  document.addEventListener('pointermove', (e) => {
-    if (press && e.pointerId === press.id && !press.circle) { press.x = e.clientX; press.y = e.clientY; }
-  });
-  document.addEventListener('pointerup', (e) => endPress(e, false));
-  document.addEventListener('pointercancel', (e) => endPress(e, true));
+  }
+  function movePress(id, x, y) {
+    if (press && id === press.id && !press.circle) { press.x = x; press.y = y; }
+  }
+
+  // Touch screens: use touch events and block the browser's own long-press
+  // behaviour (text selection, magnifier, context menu) so it can't steal the hold.
+  const opts = { passive: false };
+  document.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    const t = e.changedTouches[0];
+    beginPress('t' + t.identifier, t.clientX, t.clientY);
+  }, opts);
+  document.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    for (const t of e.changedTouches) movePress('t' + t.identifier, t.clientX, t.clientY);
+  }, opts);
+  document.addEventListener('touchend', (e) => {
+    e.preventDefault();
+    for (const t of e.changedTouches) endPress('t' + t.identifier, false);
+  }, opts);
+  document.addEventListener('touchcancel', (e) => {
+    for (const t of e.changedTouches) endPress('t' + t.identifier, true);
+  }, opts);
+
+  // Mouse and pen (desktop).
+  document.addEventListener('pointerdown', (e) => { if (e.pointerType !== 'touch') beginPress('p' + e.pointerId, e.clientX, e.clientY); });
+  document.addEventListener('pointermove', (e) => { if (e.pointerType !== 'touch') movePress('p' + e.pointerId, e.clientX, e.clientY); });
+  document.addEventListener('pointerup', (e) => { if (e.pointerType !== 'touch') endPress('p' + e.pointerId, false); });
+  document.addEventListener('pointercancel', (e) => { if (e.pointerType !== 'touch') endPress('p' + e.pointerId, true); });
   document.addEventListener('contextmenu', (e) => e.preventDefault());
 </script>
 </body>
