@@ -62,11 +62,21 @@
     dirty = true;
   }
 
-  // Scale everything by k around screen point (px, py), then move by (dx, dy).
-  function transformAll(k, px, py, dx, dy) {
+  // Rotate everything by angle a (radians) and scale by k around screen point
+  // (px, py), then move by (dx, dy).
+  function transformAll(k, px, py, dx, dy, a = 0) {
+    const cos = Math.cos(a) * k, sin = Math.sin(a) * k;
+    const cs = Math.cos(a), sn = Math.sin(a);
     for (const c of circles) {
-      if (c.big) { c.ox = px + (c.ox - px) * k + dx; c.oy = py + (c.oy - py) * k + dy; }
-      else       { c.cx = px + (c.cx - px) * k + dx; c.cy = py + (c.cy - py) * k + dy; }
+      if (c.big) {
+        const x = c.ox - px, y = c.oy - py;
+        c.ox = px + x * cos - y * sin + dx; c.oy = py + x * sin + y * cos + dy;
+        const nx = c.nx * cs - c.ny * sn, ny = c.nx * sn + c.ny * cs;
+        c.nx = nx; c.ny = ny;
+      } else {
+        const x = c.cx - px, y = c.cy - py;
+        c.cx = px + x * cos - y * sin + dx; c.cy = py + x * sin + y * cos + dy;
+      }
       c.r *= k;
     }
     normalise();
@@ -196,12 +206,13 @@
 
   // ----- Touch: one finger presses, two fingers pinch to zoom and pan -----
   const touches = new Map(); // id -> {x, y}
-  let pinch = null;          // {d, mx, my} from the previous frame
+  let pinch = null;          // {d, a, mx, my} from the previous frame
   let gestureUsed = false;   // true once a pinch happened, until every finger is up
   const pts = () => [...touches.values()];
   function pinchState() {
     const [a, b] = pts();
-    return { d: Math.hypot(a.x - b.x, a.y - b.y) || 1, mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
+    return { d: Math.hypot(a.x - b.x, a.y - b.y) || 1, a: Math.atan2(b.y - a.y, b.x - a.x),
+             mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
   }
 
   const opts = { passive: false };
@@ -225,7 +236,9 @@
     }
     if (pinch && touches.size >= 2) {
       const now = pinchState();
-      transformAll(now.d / pinch.d, pinch.mx, pinch.my, now.mx - pinch.mx, now.my - pinch.my);
+      let da = now.a - pinch.a;               // twist between frames, kept within ±180°
+      if (da > Math.PI) da -= 2 * Math.PI; else if (da < -Math.PI) da += 2 * Math.PI;
+      transformAll(now.d / pinch.d, pinch.mx, pinch.my, now.mx - pinch.mx, now.my - pinch.my, da);
       pinch = now;
     }
   }, opts);
@@ -247,7 +260,8 @@
   document.addEventListener('pointercancel', (e) => { if (e.pointerType !== 'touch') endPress(false); });
   document.addEventListener('wheel', (e) => {
     e.preventDefault();
-    transformAll(Math.exp(-e.deltaY * 0.0015), e.clientX, e.clientY, 0, 0);
+    if (e.shiftKey) transformAll(1, e.clientX, e.clientY, 0, 0, (e.deltaY || e.deltaX) * 0.003); // Shift + scroll rotates
+    else transformAll(Math.exp(-e.deltaY * 0.0015), e.clientX, e.clientY, 0, 0);
   }, { passive: false });
   document.addEventListener('contextmenu', (e) => e.preventDefault());
 
