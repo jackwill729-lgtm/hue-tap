@@ -11,15 +11,18 @@
   html,body{margin:0;height:100%;overflow:hidden;touch-action:none;overscroll-behavior:none;
     -webkit-tap-highlight-color:transparent;-webkit-touch-callout:none;user-select:none;-webkit-user-select:none}
   body{background:hsl(200,70%,55%);transition:background-color .35s ease;cursor:pointer}
-  .circle{position:fixed;width:0;height:0;border-radius:50%;transform:translate(-50%,-50%);
-    background:#fff;pointer-events:none}
+  #world{position:fixed;left:0;top:0;width:0;height:0;transform-origin:0 0;pointer-events:none}
+  .circle{position:absolute;width:0;height:0;border-radius:50%;transform:translate(-50%,-50%);background:#fff}
 </style>
 </head>
 <body>
+<div id="world"></div>
 <script>
-  const HOLD_MS = 500;         // how long to hold before the circle appears
-  const GROW_PX_PER_S = 160;   // how fast the circle's radius grows
+  const HOLD_MS = 500;         // how long to hold before a circle appears
+  const GROW_PX_PER_S = 160;   // how fast a circle's radius grows, in screen pixels
+  const MIN_ZOOM = 0.2, MAX_ZOOM = 10;
 
+  // ----- Colour -----
   let hue = Math.floor(Math.random() * 360);
   const theme = document.querySelector('meta[name=theme-color]');
   function paint() {
@@ -27,44 +30,44 @@
     document.body.style.backgroundColor = c;
     theme.setAttribute('content', c);
   }
-  function nextHue() {
-    hue = (hue + 40 + Math.floor(Math.random() * 240)) % 360;
-    paint();
-  }
+  function nextHue() { hue = (hue + 40 + Math.floor(Math.random() * 240)) % 360; paint(); }
   paint();
 
-  // One active press at a time.
+  // ----- Zoomable layer holding the circles -----
+  const world = document.getElementById('world');
+  const view = { s: 1, tx: 0, ty: 0 };
+  const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+  function applyView() { world.style.transform = `translate(${view.tx}px, ${view.ty}px) scale(${view.s})`; }
+  const toWorld = (x, y) => ({ x: (x - view.tx) / view.s, y: (y - view.ty) / view.s });
+  // Zoom to scale s while keeping world point (wx, wy) under screen point (sx, sy).
+  function zoomTo(s, wx, wy, sx, sy) {
+    view.s = clamp(s, MIN_ZOOM, MAX_ZOOM);
+    view.tx = sx - wx * view.s;
+    view.ty = sy - wy * view.s;
+    applyView();
+  }
+  applyView();
+
+  // ----- Press: tap for colour, hold to grow a circle -----
   let press = null; // {id, x, y, timer, circle, start, raf}
 
   function startCircle() {
+    const p = toWorld(press.x, press.y);
     const el = document.createElement('div');
     el.className = 'circle';
-    el.style.left = press.x + 'px';
-    el.style.top = press.y + 'px';
-    document.body.appendChild(el);
+    el.style.left = p.x + 'px';
+    el.style.top = p.y + 'px';
+    world.appendChild(el);
     press.circle = el;
     press.start = performance.now();
     const grow = (now) => {
       if (!press || press.circle !== el) return;
-      const r = ((now - press.start) / 1000) * GROW_PX_PER_S;
-      el.style.width = el.style.height = (2 * r) + 'px';
+      const screenR = ((now - press.start) / 1000) * GROW_PX_PER_S;
+      el.style.width = el.style.height = (2 * screenR / view.s) + 'px';
       press.raf = requestAnimationFrame(grow);
     };
     press.raf = requestAnimationFrame(grow);
     if (navigator.vibrate) navigator.vibrate(15);
-  }
-
-  function endPress(id, cancelled) {
-    if (!press || id !== press.id) return;
-    clearTimeout(press.timer);
-    cancelAnimationFrame(press.raf);
-    if (press.circle) {
-      // Held long enough: the circle stops growing and stays on screen.
-    } else if (!cancelled) {
-      // Short tap: change the colour.
-      nextHue();
-    }
-    press = null;
   }
   function beginPress(id, x, y) {
     if (press) return;
@@ -74,32 +77,75 @@
   function movePress(id, x, y) {
     if (press && id === press.id && !press.circle) { press.x = x; press.y = y; }
   }
+  // Ends the press. A circle that was growing stops and stays on screen.
+  function endPress(tap) {
+    if (!press) return;
+    clearTimeout(press.timer);
+    cancelAnimationFrame(press.raf);
+    if (!press.circle && tap) nextHue();
+    press = null;
+  }
 
-  // Touch screens: use touch events and block the browser's own long-press
-  // behaviour (text selection, magnifier, context menu) so it can't steal the hold.
+  // ----- Touch: one finger presses, two fingers pinch to zoom and pan -----
+  const touches = new Map(); // id -> {x, y}
+  let pinch = null;          // {d0, s0, wx, wy}
+  let gestureUsed = false;   // true once a pinch happened, until every finger is up
+
+  const pts = () => [...touches.values()];
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y) || 1;
+  const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+  function startPinch() {
+    const [a, b] = pts();
+    const m = mid(a, b), w = toWorld(m.x, m.y);
+    pinch = { d0: dist(a, b), s0: view.s, wx: w.x, wy: w.y };
+  }
+
   const opts = { passive: false };
   document.addEventListener('touchstart', (e) => {
     e.preventDefault();
-    const t = e.changedTouches[0];
-    beginPress('t' + t.identifier, t.clientX, t.clientY);
+    for (const t of e.changedTouches) touches.set(t.identifier, { x: t.clientX, y: t.clientY });
+    if (touches.size === 1 && !gestureUsed) {
+      const t = e.changedTouches[0];
+      beginPress(t.identifier, t.clientX, t.clientY);
+    } else if (touches.size >= 2) {
+      endPress(false);          // a second finger means zoom, not a tap or hold
+      gestureUsed = true;
+      startPinch();
+    }
   }, opts);
   document.addEventListener('touchmove', (e) => {
     e.preventDefault();
-    for (const t of e.changedTouches) movePress('t' + t.identifier, t.clientX, t.clientY);
+    for (const t of e.changedTouches) {
+      if (touches.has(t.identifier)) touches.set(t.identifier, { x: t.clientX, y: t.clientY });
+      movePress(t.identifier, t.clientX, t.clientY);
+    }
+    if (pinch && touches.size >= 2) {
+      const [a, b] = pts(), m = mid(a, b);
+      zoomTo(pinch.s0 * dist(a, b) / pinch.d0, pinch.wx, pinch.wy, m.x, m.y);
+    }
   }, opts);
-  document.addEventListener('touchend', (e) => {
-    e.preventDefault();
-    for (const t of e.changedTouches) endPress('t' + t.identifier, false);
-  }, opts);
-  document.addEventListener('touchcancel', (e) => {
-    for (const t of e.changedTouches) endPress('t' + t.identifier, true);
-  }, opts);
+  function liftTouches(e, cancelled) {
+    for (const t of e.changedTouches) {
+      touches.delete(t.identifier);
+      if (press && press.id === t.identifier) endPress(!cancelled && !gestureUsed);
+    }
+    if (touches.size >= 2) startPinch();   // re-anchor if fingers changed mid-pinch
+    else pinch = null;
+    if (touches.size === 0) gestureUsed = false;
+  }
+  document.addEventListener('touchend', (e) => { e.preventDefault(); liftTouches(e, false); }, opts);
+  document.addEventListener('touchcancel', (e) => liftTouches(e, true), opts);
 
-  // Mouse and pen (desktop).
-  document.addEventListener('pointerdown', (e) => { if (e.pointerType !== 'touch') beginPress('p' + e.pointerId, e.clientX, e.clientY); });
-  document.addEventListener('pointermove', (e) => { if (e.pointerType !== 'touch') movePress('p' + e.pointerId, e.clientX, e.clientY); });
-  document.addEventListener('pointerup', (e) => { if (e.pointerType !== 'touch') endPress('p' + e.pointerId, false); });
-  document.addEventListener('pointercancel', (e) => { if (e.pointerType !== 'touch') endPress('p' + e.pointerId, true); });
+  // ----- Mouse (desktop): click/hold like a finger, scroll wheel to zoom -----
+  document.addEventListener('pointerdown', (e) => { if (e.pointerType !== 'touch') beginPress('m', e.clientX, e.clientY); });
+  document.addEventListener('pointermove', (e) => { if (e.pointerType !== 'touch') movePress('m', e.clientX, e.clientY); });
+  document.addEventListener('pointerup', (e) => { if (e.pointerType !== 'touch') endPress(true); });
+  document.addEventListener('pointercancel', (e) => { if (e.pointerType !== 'touch') endPress(false); });
+  document.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const w = toWorld(e.clientX, e.clientY);
+    zoomTo(view.s * Math.exp(-e.deltaY * 0.0015), w.x, w.y, e.clientX, e.clientY);
+  }, { passive: false });
   document.addEventListener('contextmenu', (e) => e.preventDefault());
 </script>
 </body>
