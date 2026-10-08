@@ -41,7 +41,7 @@
   const hueGap = (a, b) => { const d = Math.abs(a - b) % 360; return Math.min(d, 360 - d); };
   // Circles may share colours (identical hues repel each other the hardest).
   // A random whole-degree hue at least `minGap` degrees from every hue in `avoid`
-  // (so a tap's change is easy to see and a circle never vanishes into the background).
+  // (so a tap's change is easy to see).
   function randomHue(avoid, minGap) {
     for (let tries = 0; tries < 100; tries++) {
       const h = Math.floor(Math.random() * 360);
@@ -214,6 +214,7 @@
   const G = 6;              // overall strength
   const DAMPING = 1.2;      // friction, per second
   const RESTITUTION = 0.3;  // bounciness when circles touch
+  const SOFT_RATE = 30;     // how quickly partly permeable circles are eased apart (per second)
   let forcesOn = false;
   let lastT = performance.now();
 
@@ -224,6 +225,9 @@
     for (const c of circles) {
       if (c.big || !(c.r > 0) || (press && press.circle === c)) continue;
       c.vx = c.vx || 0; c.vy = c.vy || 0; c.ax = 0; c.ay = 0;
+      // Solidity = 1 - permeability: a circle the background's colour lets others
+      // pass straight through it; the opposite colour is fully solid. White is solid.
+      c.solid = c.hue == null ? 1 : hueGap(c.hue, hue) / 180;
       bodies.push(c);
       if (c.hue != null) {
         const t = c.hue * Math.PI / 180; c.hc = Math.cos(t); c.hs = Math.sin(t);  // cos(gap) = hc·hc' + hs·hs'
@@ -268,18 +272,26 @@
       for (let j = i + 1; j < m; j++) {
         const b = bodies[j];
         if (b.lx > right) break;
+        const sol = a.solid * b.solid;
+        if (sol <= 0) continue;                   // fully permeable: they pass through each other
         const dx = b.cx - a.cx, dy = b.cy - a.cy, min = a.r + b.r;
         if (Math.abs(dy) >= min) continue;
         const d = Math.sqrt(dx * dx + dy * dy);
         if (d >= min || d === 0) continue;
         // Mass ~ r², scaled by the bigger circle so tiny circles never underflow.
         const s = a.r > b.r ? a.r : b.r, ma = (a.r / s) ** 2, mb = (b.r / s) ** 2, tot = ma + mb;
-        const ux = dx / d, uy = dy / d, overlap = min - d;
+        // Partly permeable circles sink into each other and are eased apart: both the
+        // push-out and the bounce are scaled by solidity. It's set as a rate per
+        // second, so it feels the same at any sub-step count; fully solid (1) is
+        // exactly the old hard collision.
+        const push = sol >= 1 ? 1 : 1 - Math.pow(1 - sol, dt * SOFT_RATE);
+        const ux = dx / d, uy = dy / d, overlap = (min - d) * push;
         a.cx -= ux * overlap * mb / tot; a.cy -= uy * overlap * mb / tot;
         b.cx += ux * overlap * ma / tot; b.cy += uy * overlap * ma / tot;
         const rel = (b.vx - a.vx) * ux + (b.vy - a.vy) * uy;
         if (rel < 0) {
-          const ja = (1 + RESTITUTION) * rel * mb / tot, jb = (1 + RESTITUTION) * rel * ma / tot;
+          const e = (1 + RESTITUTION) * rel * push;
+          const ja = e * mb / tot, jb = e * ma / tot;
           a.vx += ja * ux; a.vy += ja * uy;
           b.vx -= jb * ux; b.vy -= jb * uy;
         }
@@ -338,7 +350,7 @@
       d.wait = emitWait();
       const ok = d.big ? isFinite(d.ox) && isFinite(d.oy) : isFinite(d.cx) && isFinite(d.cy);
       if (!ok || !isFinite(d.r)) continue;          // only if the view itself has overflowed
-      const h = randomHue([hue], 20);
+      const h = Math.floor(Math.random() * 360);   // any hue, the background's included
       const a = Math.random() * Math.PI * 2, v = d.r * (1.5 + Math.random() * 2);
       const c = d.big
         ? { big: true, ox: d.ox, oy: d.oy, nx: d.nx, ny: d.ny, r: d.r }   // huge: same edge-anchored form as the dot
@@ -544,7 +556,7 @@
   function handleTap(x, y) {
     const hit = circleAt(x, y);
     if (!hit) { nextHue(); return; }
-    const h = randomHue([hit.hue, hue], hit.hue == null ? 20 : 40);
+    const h = hit.hue == null ? Math.floor(Math.random() * 360) : randomHue([hit.hue], 40);
     hit.hue = h; hit.color = hsl(h);
     dirty = true;
   }
@@ -691,7 +703,7 @@
   document.addEventListener('contextmenu', (e) => e.preventDefault());
 
   // For testing: window.__hue exposes state.
-  window.__hue = { circles, strokes, dots, history, transformAll, get dock() { return { x: dockX, y: dockY, r: DOT_R }; }, get hue() { return hue; }, get forcesOn() { return forcesOn; } };
+  window.__hue = { circles, strokes, dots, history, transformAll, get dock() { return { x: dockX, y: dockY, r: DOT_R }; }, get hue() { return hue; }, set hue(h) { hue = h; paint(); }, get forcesOn() { return forcesOn; } };
 </script>
 </body>
 </html>
