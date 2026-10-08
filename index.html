@@ -31,7 +31,7 @@
   const DOT_R = 10;            // the black dot in the corner, and new dots, in screen pixels
   const DOT_HIT = 28;          // how close a finger must start to the corner dot to drag it
   const EMIT_MEAN_S = 1.2;     // average time between circles from one dot while forces are on
-  const EMIT_MAX = 150;        // dots stop emitting once there are this many circles
+  const FRAME_BUDGET_MS = 12;  // physics time per frame; beyond this the simulation slows rather than freezes
 
   // ----- Colour -----
   // The background and every tapped circle each have their own hue, and no two
@@ -39,21 +39,16 @@
   const WHITE = '#FFFFFF';
   const hsl = (h) => `hsl(${h},70%,55%)`;
   const hueGap = (a, b) => { const d = Math.abs(a - b) % 360; return Math.min(d, 360 - d); };
-  // Pick a new whole-degree hue: at least `far` degrees from the hues in `farFrom`
-  // (so the change is easy to see) and as far as possible from the hues in
-  // `taken`, never equal to any of them. Constraints relax only if the screen is crowded.
-  function pickHue(taken, farFrom) {
-    for (const far of [40, 25, 10, 1]) {
-      for (let gap = 20; gap >= 1; gap = gap > 1 ? Math.ceil(gap / 2) : 0) {
-        const ok = [];
-        for (let h = 0; h < 360; h++)
-          if (farFrom.every(f => hueGap(h, f) >= far) && taken.every(t => hueGap(h, t) >= gap)) ok.push(h);
-        if (ok.length) return ok[Math.floor(Math.random() * ok.length)];
-      }
+  // Circles may share colours (identical hues repel each other the hardest).
+  // A random whole-degree hue at least `minGap` degrees from every hue in `avoid`
+  // (so a tap's change is easy to see and a circle never vanishes into the background).
+  function randomHue(avoid, minGap) {
+    for (let tries = 0; tries < 100; tries++) {
+      const h = Math.floor(Math.random() * 360);
+      if (avoid.every(a => a == null || hueGap(h, a) >= minGap)) return h;
     }
-    return null; // all 360 hues are in use
+    return Math.floor(Math.random() * 360);
   }
-  const circleHues = (except) => circles.filter(c => c !== except && c.hue != null).map(c => c.hue);
   let hue = Math.floor(Math.random() * 360);
   const theme = document.querySelector('meta[name=theme-color]');
   function paint() {
@@ -61,8 +56,7 @@
     theme.setAttribute('content', hsl(hue));
   }
   function nextHue() {
-    const h = pickHue(circleHues(null), [hue]);
-    if (h != null) { hue = h; paint(); }
+    hue = randomHue([hue], 40); paint();
   }
   paint();
 
@@ -112,14 +106,25 @@
     }
     return p;
   }
+  // Bounding box of a line, plus boxes for each run of CHUNK segments so
+  // collisions only look closely at the parts of a line near a circle.
+  const CHUNK = 16;
   function strokeBox(st) {
     if (!st.box) {
       let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-      for (let i = 0; i < st.pts.length; i += 2) {
-        const x = st.pts[i], y = st.pts[i + 1];
-        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      const p = st.pts, chunks = [];
+      for (let s = 0; s < p.length; s += 2 * CHUNK) {
+        let cx0 = Infinity, cy0 = Infinity, cx1 = -Infinity, cy1 = -Infinity;
+        const end = Math.min(p.length, s + 2 * CHUNK + 2);
+        for (let i = s; i < end; i += 2) {
+          const x = p[i], y = p[i + 1];
+          if (x < cx0) cx0 = x; if (x > cx1) cx1 = x; if (y < cy0) cy0 = y; if (y > cy1) cy1 = y;
+        }
+        chunks.push(s, end, cx0, cy0, cx1, cy1);
+        if (cx0 < x0) x0 = cx0; if (cx1 > x1) x1 = cx1; if (cy0 < y0) y0 = cy0; if (cy1 > y1) y1 = cy1;
       }
       st.box = [x0, y0, x1, y1];
+      st.chunks = chunks;
     }
     return st.box;
   }
@@ -212,46 +217,71 @@
   let forcesOn = false;
   let lastT = performance.now();
 
+  const bodies = [], coloured = [];   // reused every step, no per-step garbage
+  const BUF_KEYS = ['x', 'y', 'r', 'hc', 'hs', 'ax', 'ay'], buf = { cap: 0 };
   function stepForces(dt) {
-    const bodies = circles.filter(c => !c.big && c.r > 0 && !(press && press.circle === c));
-    for (const c of bodies) { c.vx = c.vx || 0; c.vy = c.vy || 0; c.ax = 0; c.ay = 0; }
-    for (let i = 0; i < bodies.length; i++) {
-      const a = bodies[i];
-      for (let j = i + 1; j < bodies.length; j++) {
-        const b = bodies[j];
-        let dx = b.cx - a.cx, dy = b.cy - a.cy;
-        let d = Math.hypot(dx, dy);
-        if (d === 0) { dx = 1e-6 * (a.r + b.r); dy = 0; d = Math.abs(dx); }
-        const ux = dx / d, uy = dy / d;
-        if (a.hue != null && b.hue != null) {
-          const pull = -Math.cos(hueGap(a.hue, b.hue) * Math.PI / 180); // +1 attract … -1 repel
-          const soft = Math.max(d, a.r + b.r);   // no runaway force once touching
-          const k = G * pull / soft;              // 2D gravity: acceleration ~ mass / distance
-          a.ax += ux * k * b.r * b.r; a.ay += uy * k * b.r * b.r;
-          b.ax -= ux * k * a.r * a.r; b.ay -= uy * k * a.r * a.r;
-        }
+    bodies.length = 0; coloured.length = 0;
+    for (const c of circles) {
+      if (c.big || !(c.r > 0) || (press && press.circle === c)) continue;
+      c.vx = c.vx || 0; c.vy = c.vy || 0; c.ax = 0; c.ay = 0;
+      bodies.push(c);
+      if (c.hue != null) {
+        const t = c.hue * Math.PI / 180; c.hc = Math.cos(t); c.hs = Math.sin(t);  // cos(gap) = hc·hc' + hs·hs'
+        coloured.push(c);
       }
     }
+    // All pairs, on flat typed arrays (much faster than object fields for big counts).
+    const n = coloured.length;
+    if (n > buf.cap) { buf.cap = Math.max(n, buf.cap * 2); for (const k of BUF_KEYS) buf[k] = new Float64Array(buf.cap); }
+    const X = buf.x, Y = buf.y, R = buf.r, HC = buf.hc, HS = buf.hs, AX = buf.ax, AY = buf.ay;
+    for (let i = 0; i < n; i++) {
+      const c = coloured[i]; X[i] = c.cx; Y[i] = c.cy; R[i] = c.r; HC[i] = c.hc; HS[i] = c.hs; AX[i] = 0; AY[i] = 0;
+    }
+    for (let i = 0; i < n; i++) {
+      const ax0 = X[i], ay0 = Y[i], ar = R[i], ahc = HC[i], ahs = HS[i];
+      let fax = 0, fay = 0;
+      for (let j = i + 1; j < n; j++) {
+        const br = R[j], dx = X[j] - ax0, dy = Y[j] - ay0, d = Math.sqrt(dx * dx + dy * dy);
+        const ux = d > 0 ? dx / d : 1, uy = d > 0 ? dy / d : 0;
+        const pull = -(ahc * HC[j] + ahs * HS[j]);   // +1 opposite hues attract … -1 neighbours repel
+        const soft = d > ar + br ? d : ar + br;      // no runaway force once touching
+        const k = G * pull / soft;                    // 2D gravity: acceleration ~ mass / distance
+        const kb = k * br, ka = k * ar;               // (k·r)·r keeps tiny circles from underflowing
+        fax += ux * kb * br; fay += uy * kb * br;
+        AX[j] -= ux * ka * ar; AY[j] -= uy * ka * ar;
+      }
+      AX[i] += fax; AY[i] += fay;
+    }
+    for (let i = 0; i < n; i++) { coloured[i].ax = AX[i]; coloured[i].ay = AY[i]; }
     const f = Math.exp(-DAMPING * dt);
     for (const c of bodies) {
       c.vx = (c.vx + c.ax * dt) * f; c.vy = (c.vy + c.ay * dt) * f;
       c.cx += c.vx * dt; c.cy += c.vy * dt;
     }
-    // Collisions: push overlapping circles apart and soak up the impact.
-    for (let i = 0; i < bodies.length; i++) {
-      const a = bodies[i];
-      for (let j = i + 1; j < bodies.length; j++) {
+    // Collisions: push overlapping circles apart and soak up the impact. Sweep and
+    // prune: sorted by left edge, each circle only checks those starting before its right edge.
+    for (const c of bodies) c.lx = c.cx - c.r;
+    bodies.sort((p, q) => p.lx - q.lx);
+    const m = bodies.length;
+    for (let i = 0; i < m; i++) {
+      const a = bodies[i], right = a.cx + a.r;
+      for (let j = i + 1; j < m; j++) {
         const b = bodies[j];
-        const dx = b.cx - a.cx, dy = b.cy - a.cy, d = Math.hypot(dx, dy), min = a.r + b.r;
+        if (b.lx > right) break;
+        const dx = b.cx - a.cx, dy = b.cy - a.cy, min = a.r + b.r;
+        if (Math.abs(dy) >= min) continue;
+        const d = Math.sqrt(dx * dx + dy * dy);
         if (d >= min || d === 0) continue;
-        const ux = dx / d, uy = dy / d, ma = a.r * a.r, mb = b.r * b.r, overlap = min - d;
-        a.cx -= ux * overlap * mb / (ma + mb); a.cy -= uy * overlap * mb / (ma + mb);
-        b.cx += ux * overlap * ma / (ma + mb); b.cy += uy * overlap * ma / (ma + mb);
+        // Mass ~ r², scaled by the bigger circle so tiny circles never underflow.
+        const s = a.r > b.r ? a.r : b.r, ma = (a.r / s) ** 2, mb = (b.r / s) ** 2, tot = ma + mb;
+        const ux = dx / d, uy = dy / d, overlap = min - d;
+        a.cx -= ux * overlap * mb / tot; a.cy -= uy * overlap * mb / tot;
+        b.cx += ux * overlap * ma / tot; b.cy += uy * overlap * ma / tot;
         const rel = (b.vx - a.vx) * ux + (b.vy - a.vy) * uy;
         if (rel < 0) {
-          const jimp = -(1 + RESTITUTION) * rel / (1 / ma + 1 / mb);
-          a.vx -= jimp / ma * ux; a.vy -= jimp / ma * uy;
-          b.vx += jimp / mb * ux; b.vy += jimp / mb * uy;
+          const ja = (1 + RESTITUTION) * rel * mb / tot, jb = (1 + RESTITUTION) * rel * ma / tot;
+          a.vx += ja * ux; a.vy += ja * uy;
+          b.vx -= jb * ux; b.vy -= jb * uy;
         }
       }
     }
@@ -261,23 +291,26 @@
   // Keep circles on their side of every line: push out and bounce off.
   function collideLines(bodies) {
     for (const st of strokes) {
-      const p = st.pts, half = st.w / 2, [bx0, by0, bx1, by1] = strokeBox(st);
+      const p = st.pts, half = st.w / 2, [bx0, by0, bx1, by1] = strokeBox(st), ch = st.chunks;
       for (const c of bodies) {
         const reach = c.r + half;
         if (c.cx < bx0 - reach || c.cx > bx1 + reach || c.cy < by0 - reach || c.cy > by1 + reach) continue;
-        for (let i = 0; i + 3 < p.length; i += 2) {
-          const ax = p[i], ay = p[i + 1], ex = p[i + 2] - ax, ey = p[i + 3] - ay;
-          const len2 = ex * ex + ey * ey;
-          let t = len2 ? ((c.cx - ax) * ex + (c.cy - ay) * ey) / len2 : 0;
-          t = t < 0 ? 0 : t > 1 ? 1 : t;
-          const qx = ax + ex * t, qy = ay + ey * t;
-          let nx = c.cx - qx, ny = c.cy - qy, d = Math.hypot(nx, ny);
-          if (d >= reach) continue;
-          if (d === 0) { nx = -ey; ny = ex; d = Math.hypot(nx, ny) || 1; }
-          nx /= d; ny /= d;
-          c.cx = qx + nx * reach; c.cy = qy + ny * reach;
-          const vn = (c.vx || 0) * nx + (c.vy || 0) * ny;
-          if (vn < 0) { c.vx -= (1 + RESTITUTION) * vn * nx; c.vy -= (1 + RESTITUTION) * vn * ny; }
+        for (let k = 0; k < ch.length; k += 6) {
+          if (c.cx < ch[k + 2] - reach || c.cx > ch[k + 4] + reach || c.cy < ch[k + 3] - reach || c.cy > ch[k + 5] + reach) continue;
+          for (let i = ch[k]; i + 3 < ch[k + 1]; i += 2) {
+            const ax = p[i], ay = p[i + 1], ex = p[i + 2] - ax, ey = p[i + 3] - ay;
+            const len2 = ex * ex + ey * ey;
+            let t = len2 ? ((c.cx - ax) * ex + (c.cy - ay) * ey) / len2 : 0;
+            t = t < 0 ? 0 : t > 1 ? 1 : t;
+            const qx = ax + ex * t, qy = ay + ey * t;
+            let nx = c.cx - qx, ny = c.cy - qy, d = Math.hypot(nx, ny);
+            if (d >= reach) continue;
+            if (d === 0) { nx = -ey; ny = ex; d = Math.hypot(nx, ny) || 1; }
+            nx /= d; ny /= d;
+            c.cx = qx + nx * reach; c.cy = qy + ny * reach;
+            const vn = (c.vx || 0) * nx + (c.vy || 0) * ny;
+            if (vn < 0) { c.vx -= (1 + RESTITUTION) * vn * nx; c.vy -= (1 + RESTITUTION) * vn * ny; }
+          }
         }
       }
     }
@@ -299,17 +332,18 @@
   // Each dot now and then drops a coloured circle its own size, with a small
   // push in a random direction, while forces are on.
   function emit(dt) {
-    const sx = W / 2, sy = H / 2, diag = Math.hypot(W, H);
     for (const d of dots) {
       d.wait -= dt;
       if (d.wait > 0) continue;
       d.wait = emitWait();
-      if (d.big || d.r < 2 || d.r > 2000 || circles.length >= EMIT_MAX) continue;
-      if (Math.hypot(d.cx - sx, d.cy - sy) - d.r > diag) continue;     // far off screen
-      const h = pickHue([...circleHues(null), hue], []);
-      if (h == null) continue;
+      const ok = d.big ? isFinite(d.ox) && isFinite(d.oy) : isFinite(d.cx) && isFinite(d.cy);
+      if (!ok || !isFinite(d.r)) continue;          // only if the view itself has overflowed
+      const h = randomHue([hue], 20);
       const a = Math.random() * Math.PI * 2, v = d.r * (1.5 + Math.random() * 2);
-      const c = { cx: d.cx + Math.cos(a) * d.r * 0.05, cy: d.cy + Math.sin(a) * d.r * 0.05, r: d.r, hue: h, color: hsl(h), vx: Math.cos(a) * v, vy: Math.sin(a) * v };
+      const c = d.big
+        ? { big: true, ox: d.ox, oy: d.oy, nx: d.nx, ny: d.ny, r: d.r }   // huge: same edge-anchored form as the dot
+        : { cx: d.cx + Math.cos(a) * d.r * 0.05, cy: d.cy + Math.sin(a) * d.r * 0.05, r: d.r };
+      c.hue = h; c.color = hsl(h); c.vx = Math.cos(a) * v; c.vy = Math.sin(a) * v;
       circles.push(c);
       history.push({ type: 'circle', obj: c });
     }
@@ -358,7 +392,13 @@
       let worst = 0;
       for (const c of circles) if (!c.big && c.r > 0 && c.vx) worst = Math.max(worst, Math.hypot(c.vx, c.vy) * dt / c.r);
       const steps = Math.min(60, Math.max(3, Math.ceil(worst * 3)));
-      for (let i = 0; i < steps; i++) stepForces(dt / steps);
+      // With very many circles, stop when the frame's physics budget is spent:
+      // the simulation runs slower instead of the screen freezing.
+      const t0 = performance.now();
+      for (let i = 0; i < steps; i++) {
+        stepForces(dt / steps);
+        if (performance.now() - t0 > FRAME_BUDGET_MS) break;
+      }
       normalise();
       dirty = true;
     }
@@ -504,9 +544,7 @@
   function handleTap(x, y) {
     const hit = circleAt(x, y);
     if (!hit) { nextHue(); return; }
-    const far = hit.hue == null ? [hue] : [hue, hit.hue];
-    const h = pickHue([...circleHues(hit), hue], far);
-    if (h == null) return;
+    const h = randomHue([hit.hue, hue], hit.hue == null ? 20 : 40);
     hit.hue = h; hit.color = hsl(h);
     dirty = true;
   }
