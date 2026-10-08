@@ -49,7 +49,7 @@
   const EMIT_MEAN_S = 1.2;     // average time between circles from one dot while forces are on
   const FRAME_BUDGET_MS = 12;  // physics time per frame; beyond this the simulation slows rather than freezes
   const SPAWNER_R = 10;        // red / blue spawners dragged from the corners, in screen pixels
-  const SPAWNER_MEAN_S = 3;    // average time between hunters / chasers from one spawner while forces are on
+  const SPAWNER_MEAN_S = 30;   // average time between hunters / chasers from one spawner while forces are on (very rare)
   const EMIT_MIN = 0.6, EMIT_MAX = 1.6;   // emitted circles: this range times the dot's radius
   const SPAWN_R = 0.8;         // spawned hunters and chasers: this fraction of the spawner's radius
   const CIRCLE_FLEE_ACCEL = 15;  // coloured circles run from hunters: hunter radii/s² at point-blank range
@@ -1283,7 +1283,7 @@
   }
   function beginPress(id, x, y) {
     if (press) return;
-    press = { id, x, y, x0: x, y0: y, circle: null, stroke: null };
+    press = { id, x, y, x0: x, y0: y, t0: performance.now(), circle: null, stroke: null };
     press.timer = setTimeout(startCircle, HOLD_MS);
   }
   // Dragging before the hold kicks in draws a line instead.
@@ -1341,7 +1341,33 @@
     cancelAnimationFrame(press.raf);
     if (press.stroke) finishStroke(press.stroke, tap);
     else if (!press.circle && tap) handleTap(press.x, press.y);
-    press = null;
+    const p = press; press = null;
+    if (!p.stroke && !p.circle && tap) noteTap(p.x0, p.y0, p.t0); else tapRun = null;   // holds and drags break a triple tap
+  }
+
+  // Three quick one-finger taps in about the same spot reset the whole game. Taps
+  // still act straight away (colour changes), the reset just wipes them too.
+  const TRIPLE_GAP_MS = 400;   // end of one tap to the start of the next
+  const TRIPLE_NEAR = 50;      // each tap within this of the first, px
+  let tapRun = null;           // {n, x, y, end}: the taps so far
+  function noteTap(x, y, t0) {
+    const now = performance.now(), r = tapRun;
+    if (r && t0 - r.end <= TRIPLE_GAP_MS && Math.hypot(x - r.x, y - r.y) <= TRIPLE_NEAR) { r.n++; r.end = now; }
+    else tapRun = { n: 1, x, y, end: now };
+    if (tapRun.n >= 3) { tapRun = null; resetGame(); }
+  }
+  // Back to a fresh start, as if the page had just loaded.
+  function resetGame() {
+    for (const a of [circles, strokes, dots, spawners, hunters, chasers, pops, history, fleeing]) a.length = 0;
+    grid = null;
+    forcesOn = false;
+    cancelTwoHold(); lastTwoTap = null; restartTap = null;
+    if (dotDrag) dotDrag = null;
+    hue = Math.floor(Math.random() * 360); paint();
+    restart();                       // player in the middle, score 0, immune for a moment, tilt re-calibrates
+    dirty = true;
+    toast('Game reset');
+    if (navigator.vibrate) navigator.vibrate([30, 50, 30, 50, 30]);
   }
 
   // ----- Touch: one finger presses, two fingers pinch to zoom and pan -----
@@ -1407,11 +1433,11 @@
     for (const t of e.changedTouches) touches.set(t.identifier, { x: t.clientX, y: t.clientY });
     if (touches.size === 1 && !gestureUsed) {
       const t = e.changedTouches[0];
-      if (playerOn && player.over) restartTap = t.identifier;   // game over: this tap only restarts
-      else if (onDock(t.clientX, t.clientY)) beginDot(t.identifier, t.clientX, t.clientY);
+      if (playerOn && player.over) { restartTap = t.identifier; tapRun = null; }   // game over: this tap only restarts
+      else if (onDock(t.clientX, t.clientY)) { tapRun = null; beginDot(t.identifier, t.clientX, t.clientY); }
       else beginPress(t.identifier, t.clientX, t.clientY);
     } else if (touches.size >= 2) {
-      restartTap = null;
+      restartTap = null; tapRun = null;
       endPress(false);          // a second finger means zoom, not a tap or hold
       endDot(false);
       gestureUsed = true;
@@ -1470,8 +1496,8 @@
   const isMouse = (e) => e.pointerType !== 'touch';
   document.addEventListener('pointerdown', (e) => {
     if (!isMouse(e)) return;
-    if (playerOn && player.over) { restartTap = 'm'; return; }
-    if (onDock(e.clientX, e.clientY)) beginDot('m', e.clientX, e.clientY); else beginPress('m', e.clientX, e.clientY);
+    if (playerOn && player.over) { restartTap = 'm'; tapRun = null; return; }
+    if (onDock(e.clientX, e.clientY)) { tapRun = null; beginDot('m', e.clientX, e.clientY); } else beginPress('m', e.clientX, e.clientY);
   });
   document.addEventListener('pointermove', (e) => { if (isMouse(e)) { movePress('m', e.clientX, e.clientY); moveDot('m', e.clientX, e.clientY); } });
   document.addEventListener('pointerup', (e) => {
@@ -1508,7 +1534,7 @@
     get player() { return { x: W / 2, y: H / 2, r: player.r, eaten: player.eaten, score: player.score, caught: player.caught, size: player.size, gameOver: player.over,
       invulnerable: invulnerable(performance.now()), huntSafe: huntSafe(performance.now()), guard: player.guard, scale: player.scale, vx: player.vx, vy: player.vy,
       tilt: [tiltX, tiltY], neutral: neutral && [neutral.beta, neutral.gamma], on: playerOn }; },
-    emitStats,
+    emitStats, resetGame, spawnWait, SPAWNER_MEAN_S,
     playerObj: player, setTilt: onTilt, restart,
     get playerOn() { return playerOn; }, set playerOn(v) { playerOn = !!v; dirty = true; overEl.style.display = playerOn && player.over ? 'block' : 'none'; } };
 </script>
