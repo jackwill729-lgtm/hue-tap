@@ -227,12 +227,13 @@
   }
   let W = innerWidth, H = innerHeight;
   const canvas = document.getElementById('c');
-  const ctx = canvas.getContext('2d'), mainCtx = ctx;
+  let ctx = canvas.getContext('2d');   // let: Edit's tiled view draws the world into a tile through it
+  const mainCtx = ctx;
   // The corner dot sits 32px in from the bottom-left, clear of any notch or home bar.
   const safeProbe = document.getElementById('safe');
   let dockX = 32, dockY = H - 32, redX = W - 32, redY = H - 32, blueX = 32, blueY = 32;
   const overlay = document.getElementById('o');   // flashing red dots and pops, redrawn every frame
-  const octx = overlay.getContext('2d');
+  let octx = overlay.getContext('2d');
   function resize() {
     W = innerWidth; H = innerHeight;
     const cs = getComputedStyle(safeProbe);
@@ -251,8 +252,13 @@
   // Rotate everything by angle a (radians) and scale by k around screen point
   // (px, py), then move by (dx, dy).
   function transformAll(k, px, py, dx, dy, a = 0) {
-    // Zooming out stops once the world just fills the screen (zooming in has no limit).
-    if (worldOn && k < 1 && world.s * k < minScale()) k = Math.min(1, minScale() / world.s);
+    // Play: zooming out stops once the world just fills the screen. Edit: no limit to
+    // speak of (the world can shrink to a thousandth of a pixel, past which the numbers
+    // would start to lose it). Zooming in has no limit.
+    if (worldOn && k < 1) {
+      const lo = mode === 'play' ? minScale() : MIN_WORLD_PX / Math.min(world.WX, world.WY);
+      if (world.s * k < lo) k = Math.min(1, lo / world.s);
+    }
     world.s *= k; world.a += a;
     { const x = world.ox - px, y = world.oy - py, c = Math.cos(a) * k, s = Math.sin(a) * k;
       world.ox = px + x * c - y * s + dx; world.oy = py + x * s + y * c + dy; }
@@ -334,6 +340,8 @@
     const c = Math.cos(world.a), s = Math.sin(world.a), hx = world.WX * world.s / 2, hy = world.WY * world.s / 2;
     world.ox = W / 2 - hx * c + hy * s; world.oy = H / 2 - hx * s - hy * c;
   }
+  const MIN_WORLD_PX = 1e-3;     // Edit: the world can shrink to this many px across, no further
+  const SEAM_MIN_PX = 8;         // the seam guide is left out once the world is smaller than this
   const minScale = () => Math.hypot(W, H) / Math.min(world.WX, world.WY);   // the world must cover the screen diagonal
   function updateWrap() {
     PXv = world.WX * world.s; PYv = world.WY * world.s;
@@ -733,26 +741,26 @@
   }
 
   // Fill a circle (small or big form), skipping it if it's off screen.
-  function fillDisc(c, ctx = mainCtx) {
-    const sx = W / 2, sy = H / 2, diag = Math.hypot(W, H);
+  function fillDisc(c, g = ctx) {
+    const sx = W / 2, sy = H / 2, diag = Math.hypot(W, H) + cullPad;   // cullPad: the tile reaches past the screen
     if (!c.big) {
       const d = Math.hypot(c.cx - sx, c.cy - sy);
       if (d - c.r > diag) return false;                                   // off screen
-      if (c.r - d > diag) { ctx.fillRect(0, 0, W, H); return false; }    // covers screen
-      ctx.beginPath(); ctx.arc(c.cx, c.cy, c.r, 0, Math.PI * 2); ctx.fill();
+      if (c.r - d > diag) { g.fillRect(sx - diag, sy - diag, 2 * diag, 2 * diag); return false; }    // covers screen
+      g.beginPath(); g.arc(c.cx, c.cy, c.r, 0, Math.PI * 2); g.fill();
       return true;
     }
     // So big its edge is a straight line on screen: fill that side.
     const inside = (sx - c.ox) * c.nx + (sy - c.oy) * c.ny;
-    if (inside > diag) { ctx.fillRect(0, 0, W, H); return false; }
+    if (inside > diag) { g.fillRect(sx - diag, sy - diag, 2 * diag, 2 * diag); return false; }
     if (inside < -diag) return false;
     const ux = -c.ny, uy = c.nx, B = diag * 2;
-    ctx.beginPath();
-    ctx.moveTo(c.ox + ux * B, c.oy + uy * B);
-    ctx.lineTo(c.ox - ux * B, c.oy - uy * B);
-    ctx.lineTo(c.ox - ux * B + c.nx * B, c.oy - uy * B + c.ny * B);
-    ctx.lineTo(c.ox + ux * B + c.nx * B, c.oy + uy * B + c.ny * B);
-    ctx.closePath(); ctx.fill();
+    g.beginPath();
+    g.moveTo(c.ox + ux * B, c.oy + uy * B);
+    g.lineTo(c.ox - ux * B, c.oy - uy * B);
+    g.lineTo(c.ox - ux * B + c.nx * B, c.oy - uy * B + c.ny * B);
+    g.lineTo(c.ox + ux * B + c.nx * B, c.oy + uy * B + c.ny * B);
+    g.closePath(); g.fill();
     return false;
   }
   // A black dot with a thin light ring so it shows on any colour.
@@ -1143,6 +1151,19 @@
     if (navigator.vibrate) navigator.vibrate(8);
   }
 
+  // No hunters left anywhere while the world runs: every chaser dies (a blue pop).
+  // Chaser spawners stay; chasers placed while Edit is paused wait for the world to run.
+  let chaserStarve = true;   // test hook: off = chasers outlive the hunters (pre-v37)
+  function starveChasers(now) {
+    if (!chaserStarve || hunters.length || !chasers.length) return;
+    for (const c of chasers) if (!c.big && c.r > 0 && isFinite(c.cx)) pops.push({ x: c.cx, y: c.cy, r: c.r * 1.5, color: BLUE, t0: now });
+    const dead = new Set(chasers);
+    chasers.length = 0;
+    let w = 0;
+    for (const it of history) if (!(it.type === 'chaser' && dead.has(it.obj))) history[w++] = it;
+    history.length = w;
+    dirty = true;
+  }
   // A red (or blue) dot with a thin light ring, pulsing about twice a second.
   function drawHunter(c, now, color = '#ff2a2a') {
     const a = 0.3 + 0.7 * (0.5 + 0.5 * Math.cos(now / 1000 * Math.PI * 4));
@@ -1164,6 +1185,11 @@
       octx.fillStyle = 'rgba(0,0,0,.6)';
       octx.beginPath(); octx.arc(c.cx, c.cy, c.r * 0.38, 0, Math.PI * 2); octx.fill();
     }
+  }
+  function drawCreatures(now) {
+    for (const sp of spawners) if (sp.r > 0) withCopies(sp, 3, (c) => drawSpawner(c, sp.kind === 'hunter' ? RED : BLUE));   // under what they release
+    for (const h of hunters) if (h.r > 0) withCopies(h, 2, (c) => drawHunter(c, now));
+    for (const c of chasers) if (c.r > 0) withCopies(c, 2, (o) => drawHunter(o, now, BLUE));
   }
   function drawOverlay(now) {
     octx.clearRect(0, 0, W, H);
@@ -1188,9 +1214,7 @@
       octx.beginPath(); octx.arc(p.x, p.y, p.r * (1 + 0.6 * t), 0, Math.PI * 2); octx.stroke();
     }
     octx.globalAlpha = 1;
-    for (const sp of spawners) if (sp.r > 0) withCopies(sp, 3, (c) => drawSpawner(c, sp.kind === 'hunter' ? RED : BLUE));   // under what they release
-    for (const h of hunters) if (h.r > 0) withCopies(h, 2, (c) => drawHunter(c, now));
-    for (const c of chasers) if (c.r > 0) withCopies(c, 2, (o) => drawHunter(o, now, BLUE));
+    if (!tiled) drawCreatures(now);            // tiled: they're in the tile
     if (mode === 'edit') drawSeams();
     if (mode === 'edit') {   // the corner docks: hunter, hunter spawner, chaser, chaser spawner
       drawHunter({ cx: redX, cy: redY, r: HUNTER_R }, now);
@@ -1210,7 +1234,7 @@
   // Edit: faint dashed lines where the world's edges were first laid out. Only a
   // guide to its size: nothing happens at them, the world just carries on round.
   function drawSeams() {
-    if (!WON) return;
+    if (!WON || PXv < SEAM_MIN_PX || PYv < SEAM_MIN_PX) return;   // tiny world: the lines would merge
     const diag = Math.hypot(W, H), sx = W / 2, sy = H / 2;
     const cu = (sx - world.ox) * C1 + (sy - world.oy) * S1, cv = (sy - world.oy) * C1 - (sx - world.ox) * S1;   // view centre in world axes
     octx.save();
@@ -1527,7 +1551,7 @@
       if (dt > 0) dotFlee(dt, now);
       eatStep();
       playerStep(now);
-      if (dt > 0) { huntStep(dt, now); chaseStep(dt, now); }
+      if (dt > 0) { huntStep(dt, now); chaseStep(dt, now); starveChasers(now); }
       catchStep(now);
     }
     holdDragged();                               // what's being dragged stays under the finger
@@ -1537,25 +1561,54 @@
       dirty = false;
       ctx.clearRect(0, 0, W, H);
       const sx = W / 2, sy = H / 2, diag = Math.hypot(W, H);
-      for (const c of circles) {
-        if (c.r <= 0) continue;
-        ctx.fillStyle = c.color;
-        withCopies(c, 0, fillDisc);
-      }
-      ctx.strokeStyle = LINE_COLOR; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-      for (const st of strokes) {
-        const [x0, y0, x1, y1] = strokeBox(st);
-        drawStroke(st, 0, 0);
-        // Near the world's edge: its copy on the other side too.
-        for (const [ox, oy] of ghostOffsets((x0 + x1) / 2, (y0 + y1) / 2, Math.hypot(x1 - x0, y1 - y0) / 2 + st.w)) drawStroke(st, ox, oy);
-      }
-      for (const d of dots) if (d.r > 0) withCopies(d, 2, drawDot);
+      tiled = WON && mode === 'edit' && world.s < minScale() * (1 - 1e-9);   // Edit, zoomed out past one world
+      if (tiled) drawTiled(now); else drawWorld();
       drawPlayer(now);
       if (mode === 'edit') drawDot({ cx: dockX, cy: dockY, r: DOT_R });   // the corner dot (Edit only)
       if (dotDrag && dotDrag.kind === 'dot') drawDot({ cx: dotDrag.x, cy: dotDrag.y, r: DOT_R });  // a dot being dragged out
     }
     drawOverlay(now);
     requestAnimationFrame(draw);
+  }
+  function drawWorld() {
+    for (const c of circles) {
+      if (c.r <= 0) continue;
+      ctx.fillStyle = c.color;
+      withCopies(c, 0, fillDisc);
+    }
+    ctx.strokeStyle = LINE_COLOR; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    for (const st of strokes) {
+      const [x0, y0, x1, y1] = strokeBox(st);
+      drawStroke(st, 0, 0);
+      // Near the world's edge: its copy on the other side too.
+      for (const [ox, oy] of ghostOffsets((x0 + x1) / 2, (y0 + y1) / 2, Math.hypot(x1 - x0, y1 - y0) / 2 + st.w)) drawStroke(st, ox, oy);
+    }
+    for (const d of dots) if (d.r > 0) withCopies(d, 2, drawDot);
+  }
+  // Edit, zoomed out until the world is smaller than the screen: draw one world into a
+  // tile (in the world's own axes) and fill the screen with it as a repeating pattern,
+  // so its copies are seen all round, however many. Cost doesn't grow with the count.
+  const TILE_MAX_PX = 2.5e6;     // the tile's resolution drops past this many device pixels
+  let tiled = false, cullPad = 0, tileC = null, tctx = null;
+  function drawTiled(now) {
+    dirty = true;                                 // hunters pulse: redraw every frame
+    const d = canvas.width / W, k = Math.min(d, Math.sqrt(TILE_MAX_PX / (PXv * PYv)));
+    const tw = Math.min(8192, Math.round(PXv * k)), th = Math.min(8192, Math.round(PYv * k));
+    if (!(tw >= 2 && th >= 2)) return;            // the world is a speck: nothing to see
+    if (!tileC) { tileC = document.createElement('canvas'); tctx = tileC.getContext('2d'); }
+    if (tileC.width !== tw || tileC.height !== th) { tileC.width = tw; tileC.height = th; }
+    tctx.setTransform(1, 0, 0, 1, 0, 0); tctx.clearRect(0, 0, tw, th);
+    const kx = tw / PXv, ky = th / PYv, sx = W / 2, sy = H / 2;
+    // screen -> tile: rotate into the world's axes, put the box round the view at the origin
+    const m = [kx * C1, -ky * S1, kx * S1, ky * C1, kx * (HPX - C1 * sx - S1 * sy), ky * (HPY + S1 * sx - C1 * sy)];
+    tctx.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]);
+    const c0 = ctx, o0 = octx;
+    ctx = tctx; octx = tctx; cullPad = Math.hypot(PXv, PYv);
+    try { drawWorld(); drawCreatures(now); }
+    finally { ctx = c0; octx = o0; cullPad = 0; }
+    const pat = ctx.createPattern(tileC, 'repeat');
+    pat.setTransform(new DOMMatrix(m).inverse());
+    ctx.fillStyle = pat; ctx.fillRect(0, 0, W, H);
   }
   // Draw something here and, if it's near the world's edge, its copies on the other side.
   function withCopies(c, pad, fn) {
@@ -1569,7 +1622,7 @@
   }
   // A line, shifted by (ox, oy) (its copy across the world's edge).
   function drawStroke(st, ox, oy) {
-    const p = st.pts, [bx0, by0, bx1, by1] = strokeBox(st), m = st.w;
+    const p = st.pts, [bx0, by0, bx1, by1] = strokeBox(st), m = st.w + cullPad;
     if (bx1 + ox < -m || by1 + oy < -m || bx0 + ox > W + m || by0 + oy > H + m || p.length < 2) return;
     ctx.lineWidth = st.w;
     ctx.beginPath();
@@ -2075,6 +2128,8 @@
     if (m !== mode) {
       mode = m;
       if (mode === 'play') {          // a fresh run on the world as it is
+        // Edit may be zoomed out past Play's limit: straight back in to it, about the centre.
+        if (worldOn && world.s < minScale()) transformAll(minScale() / world.s, W / 2, H / 2, 0, 0);
         forcesOn = true; restart(); keys.clear();
       } else {                        // freeze where it is
         forcesOn = false; player.vx = 0; player.vy = 0;
@@ -2118,7 +2173,7 @@
     get world() { updateWrap(); return { WX: world.WX, WY: world.WY, s: world.s, a: world.a, ox: world.ox, oy: world.oy, PX: PXv, PY: PYv, wrapping: WON, minScale: minScale() }; },
     get worldOn() { return worldOn; }, set worldOn(v) { worldOn = !!v; updateWrap(); },   // test hook: off = the old unbounded plane
     wrapNow: wrapAll, DOT_FLEE_RANGE, DOT_FLEE_SPEED, randomSpawners, get fps() { return fps; }, DOT_AGE_S,
-    get spawnedHunters() { return spawnedHunters; }, set spawnedHunters(v) { spawnedHunters = +v; }, CHASER_EVERY, get editRun() { return editRun; }, set editRun(v) { setRun(v); }, toggleRun };
+    get tiled() { return tiled; }, get chaserStarve() { return chaserStarve; }, set chaserStarve(v) { chaserStarve = !!v; }, MIN_WORLD_PX, get spawnedHunters() { return spawnedHunters; }, set spawnedHunters(v) { spawnedHunters = +v; }, CHASER_EVERY, get editRun() { return editRun; }, set editRun(v) { setRun(v); }, toggleRun };
 </script>
 <script src="hud.js"></script>
 </body>
