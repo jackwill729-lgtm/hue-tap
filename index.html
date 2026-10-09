@@ -57,8 +57,8 @@
   const HUNTER_R = 8;          // the red dot in the other corner, and new hunters, in screen pixels
   const HUNTER_SPEED = 25;     // hunter radii per second, so it looks the same at any zoom
   const CHASER_R = 8;          // the blue dot in the top corner, and new chasers
-  const CHASER_SPEED = 35;     // chaser radii per second: faster than hunters so they can catch them
-  const FLEE_RANGE = 12;       // hunters run from chasers closer than this many hunter radii
+  const CHASER_SPEED = 25;     // chaser radii per second: the same as hunters
+  let FLEE_RANGE = 12;         // hunters run from chasers closer than this many hunter radii (tests may set 0)
   const POP_S = 0.25;          // length of the pop animation
   const CLONE_EVERY = 20;      // a hunter clones itself every this many pops
   const EMIT_MEAN_S = 1.2;     // average time between circles from one dot while forces are on
@@ -1097,7 +1097,9 @@
       if (d2 >= P * P) continue;
       const d = Math.sqrt(d2);
       if (d + c.r > P && lensFrac(P, c.r, d) <= 0.5) continue;
-      player.eaten++; player.score++;             // a point per circle; the player doesn't grow
+      player.eaten++; player.score++;             // a point per circle
+      player.r += 0.1 * c.r;                      // and grows by a tenth of what it ate (speed stays in start radii)
+      player.size = player.r / (PLAYER_R * player.scale);
       (gone || (gone = new Set())).add(c);
       pops.push({ x: c.cx, y: c.cy, r: c.r, color: '#FFFFFF', t0: now });
     }
@@ -1532,10 +1534,14 @@
     if (ui && touches.size === 0 && !uiTouch && e.changedTouches.length === 1) { uiTouch = { id: e.changedTouches[0].identifier, el: ui }; return; }
     if (touches.size === 0) firstDownT = performance.now();
     for (const t of e.changedTouches) touches.set(t.identifier, { x: t.clientX, y: t.clientY });
-    if (mode !== 'edit') {     // Play: no editing or navigation, a tap only restarts after game over
+    if (mode !== 'edit') {     // Play: no editing or navigation; a tap changes the background, or restarts after game over
       const t = e.changedTouches[0];
+      playTap = null;
       if (touches.size === 1 && playerOn && player.over) restartTap = t.identifier;
-      else restartTap = null;
+      else {
+        restartTap = null;
+        if (touches.size === 1) playTap = { id: t.identifier, x0: t.clientX, y0: t.clientY, t0: performance.now() };
+      }
       return;
     }
     if (touches.size === 1 && !gestureUsed) {
@@ -1562,7 +1568,7 @@
     e.preventDefault();
     for (const t of e.changedTouches) {
       if (touches.has(t.identifier)) touches.set(t.identifier, { x: t.clientX, y: t.clientY });
-      if (mode !== 'edit') continue;
+      if (mode !== 'edit') { if (playTap && playTap.id === t.identifier) dragOffTap(t.clientX, t.clientY); continue; }
       movePress(t.identifier, t.clientX, t.clientY);
       moveDot(t.identifier, t.clientX, t.clientY);
     }
@@ -1584,12 +1590,20 @@
   }, opts);
   function cancelTwoHold() { if (twoHold) { clearTimeout(twoHold.timer); twoHold = null; } }
   let restartTap = null;      // the finger of a tap that will restart after game over
+  // Play: a quick tap or click (not a hold or drag) gives the background a new random hue.
+  let playTap = null;         // {id, x0, y0, t0}
+  function dragOffTap(x, y) { if (playTap && Math.hypot(x - playTap.x0, y - playTap.y0) >= DRAG_PX) playTap = null; }
+  function endPlayTap(ok) {
+    const p = playTap; playTap = null;
+    if (ok && p && mode === 'play' && !player.over && performance.now() - p.t0 < HOLD_MS) { nextHue(); dirty = true; }
+  }
   function liftTouches(e, cancelled) {
     cancelTwoHold();
     if (!cancelled) askTiltPermission();
     for (const t of e.changedTouches) {
       if (uiTouch && uiTouch.id === t.identifier) { const el = uiTouch.el; uiTouch = null; if (!cancelled) pressButton(el); continue; }
       touches.delete(t.identifier);
+      if (playTap && playTap.id === t.identifier) endPlayTap(!cancelled);
       if (restartTap === t.identifier) { restartTap = null; if (!cancelled && player.over) restart(); }
       if (press && press.id === t.identifier) endPress(!cancelled && !gestureUsed);
       if (dotDrag && dotDrag.id === t.identifier) endDot(!cancelled);
@@ -1609,11 +1623,13 @@
     if (ui) { uiMouse = ui; return; }
     mouseHeld = true; cursor = { x: e.clientX, y: e.clientY };
     if (playerOn && player.over) { restartTap = 'm'; tapRun = null; return; }
-    if (mode !== 'edit') return;
+    if (mode !== 'edit') { playTap = { id: 'm', x0: e.clientX, y0: e.clientY, t0: performance.now() }; return; }
     if (onDock(e.clientX, e.clientY)) { tapRun = null; beginDot('m', e.clientX, e.clientY); } else beginPress('m', e.clientX, e.clientY);
   });
   document.addEventListener('pointermove', (e) => { if (isMouse(e)) {
-    cursor = e.clientX >= 0 && e.clientY >= 0 && e.clientX <= W && e.clientY <= H ? { x: e.clientX, y: e.clientY } : null; movePress('m', e.clientX, e.clientY); moveDot('m', e.clientX, e.clientY); } });
+    cursor = e.clientX >= 0 && e.clientY >= 0 && e.clientX <= W && e.clientY <= H ? { x: e.clientX, y: e.clientY } : null;
+    if (playTap && playTap.id === 'm') dragOffTap(e.clientX, e.clientY);
+    movePress('m', e.clientX, e.clientY); moveDot('m', e.clientX, e.clientY); } });
   let uiMouse = null;          // the button the mouse went down on
   document.addEventListener('pointerup', (e) => {
     if (!isMouse(e)) return;
@@ -1621,9 +1637,10 @@
     mouseHeld = false;
     askTiltPermission();
     if (restartTap === 'm') { restartTap = null; if (player.over) restart(); return; }
+    if (playTap && playTap.id === 'm') { endPlayTap(true); return; }
     endPress(true); endDot(true);
   });
-  document.addEventListener('pointercancel', (e) => { if (isMouse(e)) { mouseHeld = false; endPress(false); endDot(false); } });
+  document.addEventListener('pointercancel', (e) => { if (isMouse(e)) { mouseHeld = false; if (playTap && playTap.id === 'm') playTap = null; endPress(false); endDot(false); } });
   // The cursor leaving the window or the window losing focus stops the steering.
   document.documentElement.addEventListener('mouseleave', () => { cursor = null; });
   addEventListener('mouseout', (e) => { if (!e.relatedTarget) cursor = null; });
@@ -1665,7 +1682,7 @@
     if (on && auto) hintTimer = setTimeout(() => showHint(false, false), 6000);
   }
   const HINTS = { edit: 'drag to pan · drag objects to move · click colour · hold circle · L pencil · scroll zoom · Ctrl+Z undo · R reset · Tab play',
-                  play: 'move cursor to steer · Tab edit' };
+                  play: 'move cursor to steer · click to change background · Tab edit' };
   if (laptop) document.querySelector('#over small').textContent = 'Click or press Space to play again';
 
   // ----- Edit / Play -----
@@ -1681,7 +1698,7 @@
   }
   function setMode(m) {
     if (m !== 'edit' && m !== 'play') return;
-    endPress(false); endDot(false); cancelTwoHold(); restartTap = null; tapRun = null; lastTwoTap = null;
+    endPress(false); endDot(false); cancelTwoHold(); restartTap = null; playTap = null; tapRun = null; lastTwoTap = null;
     if (m !== mode) {
       mode = m;
       if (mode === 'play') {          // a fresh run on the world as it is
@@ -1711,6 +1728,7 @@
     get redDock() { return { x: redX, y: redY, r: HUNTER_R }; }, get blueDock() { return { x: blueX, y: blueY, r: CHASER_R }; },
     get redSpawnerDock() { return { x: redX, y: redY - DOCK_GAP, r: SPAWNER_R }; }, get blueSpawnerDock() { return { x: blueX, y: blueY + DOCK_GAP, r: SPAWNER_R }; },
     get mode() { return mode; }, set mode(m) { setMode(m); }, get pencil() { return pencil; }, set pencil(v) { setPencil(v); },
+    get fleeRange() { return FLEE_RANGE; }, set fleeRange(v) { FLEE_RANGE = +v; },
     get simInEdit() { return simInEdit; }, set simInEdit(v) { simInEdit = !!v; syncPlayer(); }, set forcesOn(v) { forcesOn = !!v; }, get hue() { return hue; }, set hue(h) { hue = h; paint(); }, get forcesOn() { return forcesOn; },
     get player() { return { x: W / 2, y: H / 2, r: player.r, eaten: player.eaten, score: player.score, caught: player.caught, size: player.size, gameOver: player.over,
       invulnerable: invulnerable(performance.now()), huntSafe: huntSafe(performance.now()), guard: player.guard, scale: player.scale, vx: player.vx, vy: player.vy,
