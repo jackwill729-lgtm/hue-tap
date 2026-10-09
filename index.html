@@ -17,6 +17,12 @@
     border-radius:20px;opacity:0;transition:opacity .4s;pointer-events:none}
   #score{position:fixed;left:50%;top:calc(52px + env(safe-area-inset-top));transform:translateX(-50%);
     font:600 14px/1 -apple-system,system-ui,sans-serif;color:#fff;opacity:.85;text-shadow:0 1px 3px rgba(0,0,0,.45);pointer-events:none;white-space:nowrap}
+  #best{position:fixed;left:50%;top:calc(70px + env(safe-area-inset-top));transform:translateX(-50%);
+    font:600 11px/1 -apple-system,system-ui,sans-serif;color:#fff;opacity:.55;text-shadow:0 1px 3px rgba(0,0,0,.45);pointer-events:none;white-space:nowrap;
+    transition:color .4s,opacity .4s}
+  #best.hi{color:#FFD54A;opacity:1}
+  #overBest{display:block;font-size:14px;opacity:.9}
+  #overBest i{font-style:normal;color:#FFD54A;margin-left:6px}
   #over{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;color:#fff;pointer-events:none;white-space:nowrap;width:max-content;
     font:600 16px/1.4 -apple-system,system-ui,sans-serif;background:rgba(0,0,0,.5);padding:22px 30px;border-radius:22px;display:none}
   #over b{display:block;font-size:30px;margin-bottom:6px}
@@ -44,10 +50,11 @@
 <canvas id="o"></canvas>
 <div id="toast"></div>
 <div id="score"></div>
+<div id="best"></div>
 <div id="bar"><button id="penBtn" title="Pencil: drag draws lines (L)" aria-pressed="false">✎</button><button id="modeBtn" title="Switch Edit / Play (Tab)"><span id="mEdit" class="on">Edit</span><span id="mPlay">Play</span></button><button id="diceBtn" title="Scatter random spawners over the world (X)" aria-label="Random spawners">🎲</button><button id="runBtn" title="Run / pause the world while editing (T)" aria-label="Run" aria-pressed="false">▶</button></div>
 <div id="fps"></div>
 <div id="hint"></div>
-<div id="over"><b>Game over</b><span id="overScore"></span><small>Tap to play again</small></div>
+<div id="over"><b>Game over</b><span id="overScore"></span><span id="overBest"></span><small>Tap to play again</small></div>
 <div id="safe" style="position:fixed;visibility:hidden;pointer-events:none;padding-left:env(safe-area-inset-left,0px);padding-right:env(safe-area-inset-right,0px);padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)"></div>
 <script>
   const HOLD_MS = 500;         // how long to hold before a circle appears
@@ -1380,7 +1387,7 @@
       player.eaten++;
       player.r += 0.1 * c.r;                      // and grows by a tenth of what it ate (speed stays in start radii)
       player.size = player.r / (PLAYER_R * player.scale);
-      if (player.size > player.peak) player.peak = player.size;
+      if (player.size > player.peak) { player.peak = player.size; notePeak(); }
       player.sizeT = now;                         // the view follows after a pause
       (gone || (gone = new Set())).add(c);
       pops.push({ x: c.cx, y: c.cy, r: c.r, color: '#FFFFFF', t0: now });
@@ -1465,9 +1472,37 @@
   const scoreEl = document.getElementById('score'), overEl = document.getElementById('over');
   let shownScore = null;
   const sizePct = () => Math.round(player.size * 100);   // the reading: size as a % of the start size
+  // High score (v39): the highest peak size % reached in any Play run, kept in localStorage, so it is
+  // per device and browser. Reset never clears it. With no record yet there is nothing to beat, so
+  // the first run sets it quietly; after that, passing it updates it live with one 'New best!' per run.
+  const BEST_KEY = 'hueTap.best';
+  const bestEl = document.getElementById('best');
+  let shownBest = null, bestHiTimer = null;
+  function loadBest() {
+    try { const v = Number(localStorage.getItem(BEST_KEY)); return v > 0 ? v : 0; } catch (e) { return 0; }
+  }
+  let best = loadBest(), hadBest = best > 0;
+  const run = { beat: false, toasted: false };      // this run beat a stored best / showed the toast
+  function notePeak() {
+    if (mode !== 'play') return;                    // only real Play runs count (not the test sandbox)
+    const pk = Math.round(player.peak * 100);
+    if (!(pk > best)) return;
+    best = pk;
+    try { localStorage.setItem(BEST_KEY, String(best)); } catch (e) {}
+    if (!hadBest) return;
+    run.beat = true;
+    if (!run.toasted) {
+      run.toasted = true; toast('New best!');
+      bestEl.classList.add('hi'); clearTimeout(bestHiTimer);
+      bestHiTimer = setTimeout(() => bestEl.classList.remove('hi'), 1600);
+    }
+  }
+  function newRun() { hadBest = best > 0; run.beat = false; run.toasted = false; }
   function showScore() {
     const t = playerOn ? sizePct() + '%' : '';
     if (t !== shownScore) { scoreEl.textContent = t; shownScore = t; }
+    const b = playerOn && mode === 'play' && best > 0 ? 'best ' + best + '%' : '';
+    if (b !== shownBest) { bestEl.textContent = b; shownBest = b; }
   }
   function gameOver(now, color) {
     player.over = true; player.vx = 0; player.vy = 0;
@@ -1475,11 +1510,15 @@
     pops.push({ x: W / 2, y: H / 2, r: Math.min(player.r, 4 * Math.hypot(W, H)) * 1.5, color, t0: now });
     document.getElementById('overScore').textContent =
       `Size ${sizePct()}% · peak ${Math.round(player.peak * 100)}% · ate ${player.eaten} · caught ${player.caught}×`;
+    const ob = document.getElementById('overBest');
+    ob.textContent = best > 0 ? `Best ${best}%` : '';
+    if (run.beat) { const i = document.createElement('i'); i.textContent = 'New best!'; ob.appendChild(i); }
     overEl.style.display = 'block';
     dirty = true;
     if (navigator.vibrate) navigator.vibrate([40, 40, 120]);
   }
   function restart() {
+    newRun();
     spawnedHunters = 0;              // a fresh run: the chaser count starts again
     Object.assign(player, { r: PLAYER_R, scale: 1, eaten: 0, peak: 1, caught: 0, size: 1, sizeT: 0, over: false, vx: 0, vy: 0, guard: true, covered: false, huntSafeUntil: 0,
                             invUntil: performance.now() + INVULN_MS });
@@ -2207,6 +2246,7 @@
     get player() { return { x: W / 2, y: H / 2, r: player.r, eaten: player.eaten, score: sizePct(), peak: Math.round(player.peak * 100), caught: player.caught, size: player.size, gameOver: player.over,
       invulnerable: invulnerable(performance.now()), huntSafe: huntSafe(performance.now()), guard: player.guard, scale: player.scale, vx: player.vx, vy: player.vy,
       tilt: [tiltX, tiltY], neutral: neutral && [neutral.beta, neutral.gamma], on: playerOn }; },
+    get best() { return best; }, BEST_KEY,
     emitStats, resetGame, spawnWait, SPAWNER_MEAN_S, laptop, get cursor() { return cursor; }, get mouseHeld() { return mouseHeld; },
     get steering() { return steering; }, get hintOn() { return hintOn; },
     playerObj: player, setTilt: onTilt, restart,
