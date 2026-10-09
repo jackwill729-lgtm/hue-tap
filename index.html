@@ -1350,9 +1350,11 @@
     gameOver(now, killer.color || '#FFFFFF');
   }
   // Any hunter touching the player catches it, whatever it was chasing: the hunter
-  // is destroyed, the player loses 5 points (never below 0) and is safe from
-  // hunters for 1 s. A catch never ends the game.
+  // is destroyed, the player loses 5 points (never below 0), shrinks by 15% (not
+  // below half its start size) and is safe from hunters for 1 s. A catch never ends the game.
   const CATCH_COST = 5, CATCH_SAFE_MS = 1000;
+  const CATCH_SHRINK = 0.15;    // a catch takes this fraction off the player's radius ...
+  const CATCH_MIN_SIZE = 0.5;   // ... but never below this fraction of the start radius
   const huntSafe = (now) => now < player.huntSafeUntil;
   function catchStep(now) {
     if (!playerLive() || invulnerable(now) || huntSafe(now)) return;
@@ -1366,6 +1368,11 @@
       const k = history.findIndex(it => it.obj === h); if (k >= 0) history.splice(k, 1);
       pops.push({ x: h.cx, y: h.cy, r: h.r * 1.5, color: '#ff2a2a', t0: now });
       player.score = Math.max(0, player.score - CATCH_COST); player.caught++;
+      // ... and shrinks the player by 15% of its size, never below half its start size.
+      const oldR = player.r, floor = CATCH_MIN_SIZE * PLAYER_R * player.scale;
+      player.r = Math.max(Math.min(oldR, floor), oldR * (1 - CATCH_SHRINK));
+      player.size = player.r / (PLAYER_R * player.scale);
+      if (player.r < oldR) pops.push({ x: W / 2, y: H / 2, r: oldR / 1.6, color: '#ff2a2a', t0: now });   // a red ring closing in
       player.huntSafeUntil = now + CATCH_SAFE_MS;
       dirty = true;
       if (navigator.vibrate) navigator.vibrate([30, 30, 30]);
