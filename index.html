@@ -234,6 +234,7 @@
   let dockX = 32, dockY = H - 32, redX = W - 32, redY = H - 32, blueX = 32, blueY = 32;
   const overlay = document.getElementById('o');   // flashing red dots and pops, redrawn every frame
   let octx = overlay.getContext('2d');
+  const MAX_DPR = 2;
   function resize() {
     W = innerWidth; H = innerHeight;
     const cs = getComputedStyle(safeProbe);
@@ -241,7 +242,9 @@
     dockY = H - 32 - (parseFloat(cs.paddingBottom) || 0);
     redX = W - 32 - (parseFloat(cs.paddingRight) || 0); redY = dockY;
     blueX = dockX; blueY = 32 + (parseFloat(cs.paddingTop) || 0);       // below any notch or status bar
-    const d = devicePixelRatio || 1;
+    // v38: at most 2 canvas pixels per screen pixel. Phones at 2.6-3x paid 1.7-2.25x the
+    // pixels (memory and fill time) for a barely visible difference.
+    const d = Math.min(MAX_DPR, devicePixelRatio || 1);
     canvas.width = Math.round(W * d); canvas.height = Math.round(H * d);
     ctx.setTransform(d, 0, 0, d, 0, 0);
     overlay.width = canvas.width; overlay.height = canvas.height;
@@ -1585,30 +1588,69 @@
     }
     for (const d of dots) if (d.r > 0) withCopies(d, 2, drawDot);
   }
-  // Edit, zoomed out until the world is smaller than the screen: draw one world into a
-  // tile (in the world's own axes) and fill the screen with it as a repeating pattern,
-  // so its copies are seen all round, however many. Cost doesn't grow with the count.
-  const TILE_MAX_PX = 2.5e6;     // the tile's resolution drops past this many device pixels
-  let tiled = false, cullPad = 0, tileC = null, tctx = null;
+  // Edit, zoomed out until the world is smaller than the screen: draw one world (in
+  // its own axes) into a tile and repeat it over the screen. v38: the tile never has
+  // more pixels than the screen. v37 sized it to the world (up to 2.5M px), resized it
+  // as the zoom changed and snapshotted it into a new pattern every frame: on phones
+  // that churned through GPU textures while pinching, until the tab gave out.
+  //  - big tile (the world nearly screen-sized): drawn into a sub-rect of one canvas
+  //    made once per screen size, then stamped over the screen, a few copies;
+  //  - small tile (at most SMALL_TILE_PX): an exact-size canvas, used as a repeating
+  //    pattern, so any number of copies costs one fill.
+  const TILE_MAX_DIM = 4096;      // per side, well inside mobile canvas / texture limits
+  const SMALL_TILE_PX = 1 << 19;  // 512K px (2 MB): pattern from here down
+  let tiled = false, cullPad = 0, tileC = null, patC = null;
+  const tileStats = { mode: '', blits: 0, tw: 0, th: 0 };   // for tests
+  function renderTile(g, m, clipW, clipH, now) {
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.clearRect(0, 0, clipW, clipH);
+    g.save();
+    g.beginPath(); g.rect(0, 0, clipW, clipH); g.clip();   // copies drawn past the box edge stay out
+    g.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]);
+    const c0 = ctx, o0 = octx;
+    ctx = g; octx = g; cullPad = Math.hypot(PXv, PYv);
+    try { drawWorld(); drawCreatures(now); }
+    finally { ctx = c0; octx = o0; cullPad = 0; g.restore(); }
+  }
   function drawTiled(now) {
     dirty = true;                                 // hunters pulse: redraw every frame
-    const d = canvas.width / W, k = Math.min(d, Math.sqrt(TILE_MAX_PX / (PXv * PYv)));
-    const tw = Math.min(8192, Math.round(PXv * k)), th = Math.min(8192, Math.round(PYv * k));
-    if (!(tw >= 2 && th >= 2)) return;            // the world is a speck: nothing to see
-    if (!tileC) { tileC = document.createElement('canvas'); tctx = tileC.getContext('2d'); }
-    if (tileC.width !== tw || tileC.height !== th) { tileC.width = tw; tileC.height = th; }
-    tctx.setTransform(1, 0, 0, 1, 0, 0); tctx.clearRect(0, 0, tw, th);
+    const TW = Math.min(canvas.width, TILE_MAX_DIM), TH = Math.min(canvas.height, TILE_MAX_DIM);
+    const d = canvas.width / W, k = Math.min(d, TW / PXv, TH / PYv);   // tile px per screen px
+    const tw = Math.round(PXv * k), th = Math.round(PYv * k);
+    tileStats.blits = 0; tileStats.tw = tw; tileStats.th = th;
+    if (!(tw >= 2 && th >= 2)) { tileStats.mode = 'speck'; return; }   // the world is a speck: nothing to see
     const kx = tw / PXv, ky = th / PYv, sx = W / 2, sy = H / 2;
     // screen -> tile: rotate into the world's axes, put the box round the view at the origin
     const m = [kx * C1, -ky * S1, kx * S1, ky * C1, kx * (HPX - C1 * sx - S1 * sy), ky * (HPY + S1 * sx - C1 * sy)];
-    tctx.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]);
-    const c0 = ctx, o0 = octx;
-    ctx = tctx; octx = tctx; cullPad = Math.hypot(PXv, PYv);
-    try { drawWorld(); drawCreatures(now); }
-    finally { ctx = c0; octx = o0; cullPad = 0; }
-    const pat = ctx.createPattern(tileC, 'repeat');
-    pat.setTransform(new DOMMatrix(m).inverse());
-    ctx.fillStyle = pat; ctx.fillRect(0, 0, W, H);
+    const inv = new DOMMatrix(m).inverse();
+    if (tw * th <= SMALL_TILE_PX) {
+      if (!patC) patC = document.createElement('canvas');
+      if (patC.width !== tw || patC.height !== th) { patC.width = tw; patC.height = th; }
+      renderTile(patC.getContext('2d'), m, tw, th, now);
+      const pat = ctx.createPattern(patC, 'repeat');
+      pat.setTransform(inv);
+      ctx.fillStyle = pat; ctx.fillRect(0, 0, W, H);
+      tileStats.mode = 'pattern'; tileStats.blits = 1;
+      return;
+    }
+    if (!tileC) tileC = document.createElement('canvas');
+    if (tileC.width !== TW || tileC.height !== TH) { tileC.width = TW; tileC.height = TH; }   // once per screen size
+    renderTile(tileC.getContext('2d'), m, tw, th, now);
+    // Stamp the tile over the screen: the cells of its lattice that the screen touches.
+    let u0 = Infinity, u1 = -Infinity, v0 = Infinity, v1 = -Infinity;
+    for (const [x, y] of [[0, 0], [W, 0], [0, H], [W, H]]) {
+      const u = m[0] * x + m[2] * y + m[4], v = m[1] * x + m[3] * y + m[5];
+      u0 = Math.min(u0, u); u1 = Math.max(u1, u); v0 = Math.min(v0, v); v1 = Math.max(v1, v);
+    }
+    const i0 = Math.floor(u0 / tw), i1 = Math.floor(u1 / tw), j0 = Math.floor(v0 / th), j1 = Math.floor(v1 / th);
+    if ((i1 - i0 + 1) * (j1 - j0 + 1) > 400) return;   // can't happen with a tile this big; just in case
+    ctx.save();
+    ctx.transform(inv.a, inv.b, inv.c, inv.d, inv.e, inv.f);
+    for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) {
+      ctx.drawImage(tileC, 0, 0, tw, th, i * tw, j * th, tw, th); tileStats.blits++;
+    }
+    ctx.restore();
+    tileStats.mode = 'stamp';
   }
   // Draw something here and, if it's near the world's edge, its copies on the other side.
   function withCopies(c, pad, fn) {
@@ -2173,7 +2215,7 @@
     get world() { updateWrap(); return { WX: world.WX, WY: world.WY, s: world.s, a: world.a, ox: world.ox, oy: world.oy, PX: PXv, PY: PYv, wrapping: WON, minScale: minScale() }; },
     get worldOn() { return worldOn; }, set worldOn(v) { worldOn = !!v; updateWrap(); },   // test hook: off = the old unbounded plane
     wrapNow: wrapAll, DOT_FLEE_RANGE, DOT_FLEE_SPEED, randomSpawners, get fps() { return fps; }, DOT_AGE_S,
-    get tiled() { return tiled; }, get chaserStarve() { return chaserStarve; }, set chaserStarve(v) { chaserStarve = !!v; }, MIN_WORLD_PX, get spawnedHunters() { return spawnedHunters; }, set spawnedHunters(v) { spawnedHunters = +v; }, CHASER_EVERY, get editRun() { return editRun; }, set editRun(v) { setRun(v); }, toggleRun };
+    get tiled() { return tiled; }, tileStats, get tileCanvas() { return [tileC ? [tileC.width, tileC.height] : null, patC ? [patC.width, patC.height] : null]; }, get chaserStarve() { return chaserStarve; }, set chaserStarve(v) { chaserStarve = !!v; }, MIN_WORLD_PX, get spawnedHunters() { return spawnedHunters; }, set spawnedHunters(v) { spawnedHunters = +v; }, CHASER_EVERY, get editRun() { return editRun; }, set editRun(v) { setRun(v); }, toggleRun };
 </script>
 <script src="hud.js"></script>
 </body>
