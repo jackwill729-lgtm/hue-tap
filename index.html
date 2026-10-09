@@ -69,6 +69,7 @@
   const DOT_FLEE_SPEED = 100;  // their top speed, px/s at the starting zoom: about a fleeing coloured circle's
   const DOT_DAMPING = 2.5;     // per second, so they settle soon after the danger has gone
   const DOT_OWN_MS = 1000;     // a dot ignores circles it released this recently
+  const DOT_AGE_S = 60;        // a black dot's circles grow by their base size every this many seconds it has been running
   const EMIT_MEAN_S = 1.2;     // average time between circles from one dot while forces are on
   const FRAME_BUDGET_MS = 12;  // physics time per frame; beyond this the simulation slows rather than freezes
   const SPAWNER_R = 10;        // red / blue spawners dragged from the corners, in screen pixels
@@ -684,7 +685,9 @@
       emitStats.circle++;
       const h = Math.floor(Math.random() * 360);   // any hue, the background's included
       const a = Math.random() * Math.PI * 2, v = d.r * (1.5 + Math.random() * 2);
-      const r = d.r * (EMIT_MIN + Math.random() * (EMIT_MAX - EMIT_MIN));   // mixed sizes: some bigger than a new player
+      // Mixed sizes (some bigger than a new player), and bigger on average the older the
+      // dot: the mean doubles after a minute of running, triples after two, and so on.
+      const r = d.r * (EMIT_MIN + Math.random() * (EMIT_MAX - EMIT_MIN)) * (1 + (d.age || 0) / DOT_AGE_S);
       const c = d.big
         ? { big: true, ox: d.ox + d.nx * (d.r - r), oy: d.oy + d.ny * (d.r - r), nx: d.nx, ny: d.ny, r }   // huge: centred on the dot
         : { cx: d.cx + Math.cos(a) * d.r * 0.05, cy: d.cy + Math.sin(a) * d.r * 0.05, r };
@@ -1480,6 +1483,7 @@
     if (live && dt > 0) circleFlee(); else if (!live) fleeing.length = 0;
     let coasting = forcesOn || fleeing.length > 0;
     if (!coasting) for (const c of circles) if (c.vx || c.vy) { coasting = true; break; }
+    if (live && dt > 0) for (const d of dots) d.age = (d.age || 0) + dt;   // dots age only while the world runs
     if (live && coasting && dt > 0) {
       if (forcesOn) emit(dt);
       // Enough sub-steps that no circle moves more than a third of its radius
@@ -1612,7 +1616,7 @@
     } else if (kind === 'hunter') addHunter(x, y);
     else if (kind === 'chaser') addChaser(x, y);
     else {
-      const d = { cx: x, cy: y, r: DOT_R, wait: emitWait() };
+      const d = { cx: x, cy: y, r: DOT_R, wait: emitWait(), age: 0 };
       dots.push(d);
       history.push({ type: 'dot', obj: d });
     }
@@ -1768,7 +1772,7 @@
       }
       const [x, y] = best;
       let o;
-      if (kind === 'dot') { o = { cx: x, cy: y, r, wait: emitWait() }; dots.push(o); }
+      if (kind === 'dot') { o = { cx: x, cy: y, r, wait: emitWait(), age: 0 }; dots.push(o); }
       else { o = { cx: x, cy: y, r, kind: kind === 'hunterSpawner' ? 'hunter' : 'chaser', wait: spawnWait() }; spawners.push(o); }
       items.push({ type: kind, obj: o });
       taken.push([x, y, r]);
@@ -2068,7 +2072,7 @@
     // the wrapping world: size in load px, scale, angle, guide origin; period on screen now
     get world() { updateWrap(); return { WX: world.WX, WY: world.WY, s: world.s, a: world.a, ox: world.ox, oy: world.oy, PX: PXv, PY: PYv, wrapping: WON, minScale: minScale() }; },
     get worldOn() { return worldOn; }, set worldOn(v) { worldOn = !!v; updateWrap(); },   // test hook: off = the old unbounded plane
-    wrapNow: wrapAll, DOT_FLEE_RANGE, DOT_FLEE_SPEED, randomSpawners, get fps() { return fps; } };
+    wrapNow: wrapAll, DOT_FLEE_RANGE, DOT_FLEE_SPEED, randomSpawners, get fps() { return fps; }, DOT_AGE_S };
 </script>
 <script src="hud.js"></script>
 </body>
