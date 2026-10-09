@@ -15,12 +15,20 @@
   #toast{position:fixed;left:50%;bottom:calc(28px + env(safe-area-inset-bottom));transform:translateX(-50%);
     font:600 15px/1 -apple-system,system-ui,sans-serif;color:#fff;background:rgba(0,0,0,.45);padding:10px 16px;
     border-radius:20px;opacity:0;transition:opacity .4s;pointer-events:none}
-  #score{position:fixed;left:50%;top:calc(14px + env(safe-area-inset-top));transform:translateX(-50%);
+  #score{position:fixed;left:50%;top:calc(52px + env(safe-area-inset-top));transform:translateX(-50%);
     font:600 14px/1 -apple-system,system-ui,sans-serif;color:#fff;opacity:.85;text-shadow:0 1px 3px rgba(0,0,0,.45);pointer-events:none;white-space:nowrap}
   #over{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;color:#fff;pointer-events:none;white-space:nowrap;width:max-content;
     font:600 16px/1.4 -apple-system,system-ui,sans-serif;background:rgba(0,0,0,.5);padding:22px 30px;border-radius:22px;display:none}
   #over b{display:block;font-size:30px;margin-bottom:6px}
   #over small{display:block;margin-top:10px;font-size:14px;opacity:.85}
+  #bar{position:fixed;left:50%;top:calc(10px + env(safe-area-inset-top));transform:translateX(-50%);display:flex;gap:8px;align-items:center;z-index:2}
+  #bar button{font:600 13px/1 -apple-system,system-ui,sans-serif;color:#fff;border:0;cursor:pointer;-webkit-tap-highlight-color:transparent;touch-action:none}
+  #bar button:focus{outline:none}
+  #modeBtn{display:flex;padding:3px;border-radius:16px;background:rgba(0,0,0,.35)}
+  #modeBtn span{padding:7px 12px;border-radius:13px;opacity:.75}
+  #modeBtn span.on{background:#fff;color:#222;opacity:1}
+  #penBtn{position:absolute;right:calc(100% + 8px);top:50%;transform:translateY(-50%);width:34px;height:34px;border-radius:17px;background:rgba(0,0,0,.35);font-size:17px!important;padding:0}
+  #penBtn.on{background:#fff;color:#222!important;box-shadow:0 0 0 2px rgba(0,0,0,.25)}
   #hint{position:fixed;left:50%;bottom:calc(68px + env(safe-area-inset-bottom));transform:translateX(-50%);max-width:calc(100% - 140px);
     text-align:center;font:500 13px/1.45 -apple-system,system-ui,sans-serif;color:#fff;background:rgba(0,0,0,.35);padding:8px 14px;
     border-radius:16px;opacity:0;transition:opacity .5s;pointer-events:none;width:max-content}
@@ -31,7 +39,8 @@
 <canvas id="o"></canvas>
 <div id="toast"></div>
 <div id="score"></div>
-<div id="hint">Move cursor to steer · click colour · hold circle · drag line · scroll zoom · F forces · Ctrl+Z undo · R reset · H help</div>
+<div id="bar"><button id="penBtn" title="Pencil: drag draws lines (L)" aria-pressed="false">✎</button><button id="modeBtn" title="Switch Edit / Play (Tab)"><span id="mEdit" class="on">Edit</span><span id="mPlay">Play</span></button></div>
+<div id="hint"></div>
 <div id="over"><b>Game over</b><span id="overScore"></span><small>Tap to play again</small></div>
 <div id="safe" style="position:fixed;visibility:hidden;pointer-events:none;padding-left:env(safe-area-inset-left,0px);padding-right:env(safe-area-inset-right,0px);padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)"></div>
 <script>
@@ -43,6 +52,8 @@
   const LINE_COLOR = '#FFFFFF';
   const DOT_R = 10;            // the black dot in the corner, and new dots, in screen pixels
   const DOT_HIT = 28;          // how close a finger must start to the corner dot to drag it
+  const DOCK_GAP = 52;         // spawner docks sit this far from the hunter / chaser docks
+  const GRAB_R = 20;           // Edit: small things can be grabbed this far from their centre
   const HUNTER_R = 8;          // the red dot in the other corner, and new hunters, in screen pixels
   const HUNTER_SPEED = 25;     // hunter radii per second, so it looks the same at any zoom
   const CHASER_R = 8;          // the blue dot in the top corner, and new chasers
@@ -111,6 +122,8 @@
   // Red and blue spawners dragged out of those corners: static like black dots
   // (same small/big forms), releasing hunters (red) or chasers (blue) while forces are on.
   const spawners = [];  // {cx, cy, r, kind: 'hunter' | 'chaser', wait} or the big form
+  function addHunter(x, y, r = HUNTER_R) { const h = { cx: x, cy: y, r, popCount: 0 }; hunters.push(h); history.push({ type: 'hunter', obj: h }); return h; }
+  function addChaser(x, y, r = CHASER_R) { const c = { cx: x, cy: y, r }; chasers.push(c); history.push({ type: 'chaser', obj: c }); return c; }
   const spawnWait = () => -Math.log(1 - Math.random()) * SPAWNER_MEAN_S;
   // Red hunters dragged out of the other corner: same small/big forms as circles.
   // Each one chases the nearest circle and pops it.
@@ -123,7 +136,13 @@
   // zooming): eating a smaller circle scores a point, a hunter catching it costs 5,
   // and a bigger circle covering it ends the game. invUntil = end of the blinking
   // safe time after a restart; huntSafeUntil = end of the 1 s safe time after a catch.
-  let playerOn = true;   // tests can switch the player off
+  // Two modes. Edit: a level editor with the world frozen (navigate, place and move
+  // things). Play: the world runs, the player dot appears and the game rules apply.
+  let mode = 'edit';
+  let simInEdit = false;     // test hook: run the world while editing (the old all-in-one sandbox)
+  let pencil = false;        // Edit: a one-finger drag on empty space draws a line instead of panning
+  let playerWanted = true;   // tests can switch the player off
+  let playerOn = false;      // the player is in the game right now (Play, or the test sandbox)
   // scale = zoom since the player (re)started, so its speed scales with zoom like a hunter's;
   // guard = after a restart, stay safe until no bigger circle covers the player.
   // size is always 1 (kept for anything reading the old field).
@@ -958,11 +977,20 @@
     octx.globalAlpha = 1;
     for (const sp of spawners) if (sp.r > 0) drawSpawner(sp, sp.kind === 'hunter' ? RED : BLUE);   // under what they release
     for (const h of hunters) if (h.r > 0) drawHunter(h, now);
-    drawHunter({ cx: redX, cy: redY, r: HUNTER_R }, now);                  // the red corner dot
-    if (dotDrag && dotDrag.kind === 'hunter') drawSpawner({ cx: dotDrag.x, cy: dotDrag.y, r: SPAWNER_R }, RED);
     for (const c of chasers) if (c.r > 0) drawHunter(c, now, BLUE);
-    drawHunter({ cx: blueX, cy: blueY, r: CHASER_R }, now, BLUE);         // the blue corner dot
-    if (dotDrag && dotDrag.kind === 'chaser') drawSpawner({ cx: dotDrag.x, cy: dotDrag.y, r: SPAWNER_R }, BLUE);
+    if (mode === 'edit') {   // the corner docks: hunter, hunter spawner, chaser, chaser spawner
+      drawHunter({ cx: redX, cy: redY, r: HUNTER_R }, now);
+      drawSpawner({ cx: redX, cy: redY - DOCK_GAP, r: SPAWNER_R }, RED);
+      drawHunter({ cx: blueX, cy: blueY, r: CHASER_R }, now, BLUE);
+      drawSpawner({ cx: blueX, cy: blueY + DOCK_GAP, r: SPAWNER_R }, BLUE);
+    }
+    if (dotDrag) {           // the thing being dragged out of a corner
+      const g = { cx: dotDrag.x, cy: dotDrag.y };
+      if (dotDrag.kind === 'hunter') drawHunter({ ...g, r: HUNTER_R }, now);
+      else if (dotDrag.kind === 'chaser') drawHunter({ ...g, r: CHASER_R }, now, BLUE);
+      else if (dotDrag.kind === 'hunterSpawner') drawSpawner({ ...g, r: SPAWNER_R }, RED);
+      else if (dotDrag.kind === 'chaserSpawner') drawSpawner({ ...g, r: SPAWNER_R }, BLUE);
+    }
   }
   const BLUE = '#2a7bff', RED = '#ff2a2a';
 
@@ -1023,7 +1051,7 @@
         const sp = MAX * Math.min(1, (m - TILT_DEAD) / (TILT_FULL - TILT_DEAD));
         vx = tiltX / m * sp; vy = tiltY / m * sp;
       }
-      if (laptop && cursor && !mouseHeld) {
+      if (laptop && mode === 'play' && cursor && !mouseHeld) {
         const ex = cursor.x - W / 2, ey = cursor.y - H / 2, m = Math.hypot(ex, ey);
         const dead = CURSOR_DEAD * Math.max(player.r, 0), full = Math.max(dead + 1, CURSOR_FULL * Math.min(W, H));
         if (m > dead) {
@@ -1184,10 +1212,11 @@
     now = now || performance.now();
     const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
     const tFrame = performance.now();   // the physics budget includes working out who flees
-    if (dt > 0) circleFlee();
+    const live = mode === 'play' || simInEdit;   // Edit freezes the world
+    if (live && dt > 0) circleFlee(); else if (!live) fleeing.length = 0;
     let coasting = forcesOn || fleeing.length > 0;
     if (!coasting) for (const c of circles) if (c.vx || c.vy) { coasting = true; break; }
-    if (coasting && dt > 0) {
+    if (live && coasting && dt > 0) {
       if (forcesOn) emit(dt);
       // Enough sub-steps that no circle moves more than a third of its radius
       // per step, so circles can't tunnel through a line.
@@ -1204,11 +1233,13 @@
       dirty = true;
     }
     player.cx = W / 2; player.cy = H / 2;
-    if (dt > 0) movePlayer(dt, now);
-    eatStep();
-    playerStep(now);
-    if (dt > 0) { huntStep(dt, now); chaseStep(dt, now); }
-    catchStep(now);
+    if (live) {
+      if (dt > 0) movePlayer(dt, now);
+      eatStep();
+      playerStep(now);
+      if (dt > 0) { huntStep(dt, now); chaseStep(dt, now); }
+      catchStep(now);
+    }
     if (playerOn && (invulnerable(now) || huntSafe(now))) dirty = true;   // blinking
     showScore();
     if (dirty) {
@@ -1249,7 +1280,7 @@
       }
       for (const d of dots) if (d.r > 0) drawDot(d);
       drawPlayer(now);
-      drawDot({ cx: dockX, cy: dockY, r: DOT_R });                         // the corner dot
+      if (mode === 'edit') drawDot({ cx: dockX, cy: dockY, r: DOT_R });   // the corner dot (Edit only)
       if (dotDrag && dotDrag.kind === 'dot') drawDot({ cx: dotDrag.x, cy: dotDrag.y, r: DOT_R });  // a dot being dragged out
     }
     drawOverlay(now);
@@ -1271,10 +1302,15 @@
   requestAnimationFrame(draw);
 
   // ----- Corner dots: drag from the black one to place a dot, from the red one to place a hunter -----
-  let dotDrag = null; // {id, x, y, kind: 'dot' | 'hunter' | 'chaser'}
-  const dockAt = (x, y) => Math.hypot(x - dockX, y - dockY) <= DOT_HIT ? 'dot'
-                         : Math.hypot(x - redX, y - redY) <= DOT_HIT ? 'hunter'
-                         : Math.hypot(x - blueX, y - blueY) <= DOT_HIT ? 'chaser' : null;
+  let dotDrag = null; // {id, x, y, kind: 'dot' | 'hunter' | 'chaser' | 'hunterSpawner' | 'chaserSpawner'}
+  const docks = () => [['dot', dockX, dockY], ['hunter', redX, redY], ['hunterSpawner', redX, redY - DOCK_GAP],
+                       ['chaser', blueX, blueY], ['chaserSpawner', blueX, blueY + DOCK_GAP]];
+  function dockAt(x, y) {           // the nearest corner dock under a point (Edit only)
+    if (mode !== 'edit') return null;
+    let best = null, bd = DOT_HIT;
+    for (const [k, dx, dy] of docks()) { const d = Math.hypot(x - dx, y - dy); if (d <= bd) { bd = d; best = k; } }
+    return best;
+  }
   const onDock = (x, y) => dockAt(x, y) != null;
   function beginDot(id, x, y) { dotDrag = { id, x, y, kind: dockAt(x, y) }; dirty = true; }
   function moveDot(id, x, y) {
@@ -1285,11 +1321,13 @@
     if (!dotDrag) return;
     const { x, y, kind } = dotDrag; dotDrag = null; dirty = true;
     if (!place || onDock(x, y) || x < 0 || y < 0 || x > W || y > H) return;  // dropped back on a corner: cancel
-    if (kind === 'chaser' || kind === 'hunter') {
-      const sp = { cx: x, cy: y, r: SPAWNER_R, kind, wait: spawnWait() };
+    if (kind === 'hunterSpawner' || kind === 'chaserSpawner') {
+      const sp = { cx: x, cy: y, r: SPAWNER_R, kind: kind === 'hunterSpawner' ? 'hunter' : 'chaser', wait: spawnWait() };
       spawners.push(sp);
-      history.push({ type: kind + 'Spawner', obj: sp });
-    } else {
+      history.push({ type: kind, obj: sp });
+    } else if (kind === 'hunter') addHunter(x, y);
+    else if (kind === 'chaser') addChaser(x, y);
+    else {
       const d = { cx: x, cy: y, r: DOT_R, wait: emitWait() };
       dots.push(d);
       history.push({ type: 'dot', obj: d });
@@ -1315,18 +1353,42 @@
     press.raf = requestAnimationFrame(grow);
     if (navigator.vibrate) navigator.vibrate(15);
   }
+  // Edit: the top-most thing under a point that a drag would move (lines excluded).
+  // Small things can be grabbed up to GRAB_R px from their centre.
+  function objectAt(x, y) {
+    const hit = (c) => c.r > 0 && (c.big ? (x - c.ox) * c.nx + (y - c.oy) * c.ny >= 0
+                                         : Math.hypot(x - c.cx, y - c.cy) <= Math.max(c.r, GRAB_R));
+    for (const list of [chasers, hunters, spawners, dots, circles])   // drawn on top first
+      for (let i = list.length - 1; i >= 0; i--) if (hit(list[i])) return list[i];
+    return null;
+  }
+  function moveObj(o, dx, dy) {
+    if (o.big) { o.ox += dx; o.oy += dy; } else { o.cx += dx; o.cy += dy; }
+    dirty = true;
+  }
   function beginPress(id, x, y) {
     if (press) return;
-    press = { id, x, y, x0: x, y0: y, t0: performance.now(), circle: null, stroke: null };
-    press.timer = setTimeout(startCircle, HOLD_MS);
+    press = { id, x, y, x0: x, y0: y, lx: x, ly: y, t0: performance.now(), circle: null, stroke: null,
+              obj: pencil ? null : objectAt(x, y), moving: false, pan: false };
+    if (!press.obj) press.timer = setTimeout(startCircle, HOLD_MS);   // hold on empty space grows a circle
   }
-  // Dragging before the hold kicks in draws a line instead.
+  // Edit: dragging (before the hold kicks in) moves the thing under the finger, pans
+  // the view on empty space, or with the pencil on draws a line.
   function movePress(id, x, y) {
     if (!press || id !== press.id || press.circle) return;
     press.x = x; press.y = y;
-    if (!press.stroke) {
+    if (!press.stroke && !press.moving && !press.pan) {
       if (Math.hypot(x - press.x0, y - press.y0) < DRAG_PX) return;
       clearTimeout(press.timer);
+      if (press.obj) press.moving = true;
+      else if (!pencil) press.pan = true;
+    }
+    if (press.moving || press.pan) {
+      const dx = x - press.lx, dy = y - press.ly; press.lx = x; press.ly = y;
+      if (press.moving) moveObj(press.obj, dx, dy); else transformAll(1, 0, 0, dx, dy);
+      return;
+    }
+    if (!press.stroke) {
       press.stroke = { raw: [press.x0, press.y0], pts: [press.x0, press.y0], w: LINE_WIDTH, box: null };
       strokes.push(press.stroke);
       history.push({ type: 'line', obj: press.stroke });
@@ -1373,10 +1435,11 @@
     if (!press) return;
     clearTimeout(press.timer);
     cancelAnimationFrame(press.raf);
-    if (press.stroke) finishStroke(press.stroke, tap);
-    else if (!press.circle && tap) handleTap(press.x, press.y);
     const p = press; press = null;
-    if (!p.stroke && !p.circle && tap) noteTap(p.x0, p.y0, p.t0); else tapRun = null;   // holds and drags break a triple tap
+    const isTap = tap && !p.stroke && !p.circle && !p.moving && !p.pan;
+    if (p.stroke) finishStroke(p.stroke, tap);
+    else if (isTap) handleTap(p.x, p.y);
+    if (isTap) noteTap(p.x0, p.y0, p.t0); else tapRun = null;   // holds and drags break a triple tap
   }
 
   // Three quick one-finger taps in about the same spot reset the whole game. Taps
@@ -1394,7 +1457,7 @@
   function resetGame() {
     for (const a of [circles, strokes, dots, spawners, hunters, chasers, pops, history, fleeing]) a.length = 0;
     grid = null;
-    forcesOn = false;
+    forcesOn = mode === 'play';
     cancelTwoHold(); lastTwoTap = null; restartTap = null;
     if (dotDrag) dotDrag = null;
     hue = Math.floor(Math.random() * 360); paint();
@@ -1461,10 +1524,20 @@
   }
 
   const opts = { passive: false };
+  let uiTouch = null;         // {id, el}: a finger on the Edit/Play pill or the pencil
+  const uiButton = (e) => e.target && e.target.closest ? e.target.closest('#bar button') : null;
   document.addEventListener('touchstart', (e) => {
     e.preventDefault();
+    const ui = uiButton(e);
+    if (ui && touches.size === 0 && !uiTouch && e.changedTouches.length === 1) { uiTouch = { id: e.changedTouches[0].identifier, el: ui }; return; }
     if (touches.size === 0) firstDownT = performance.now();
     for (const t of e.changedTouches) touches.set(t.identifier, { x: t.clientX, y: t.clientY });
+    if (mode !== 'edit') {     // Play: no editing or navigation, a tap only restarts after game over
+      const t = e.changedTouches[0];
+      if (touches.size === 1 && playerOn && player.over) restartTap = t.identifier;
+      else restartTap = null;
+      return;
+    }
     if (touches.size === 1 && !gestureUsed) {
       const t = e.changedTouches[0];
       if (playerOn && player.over) { restartTap = t.identifier; tapRun = null; }   // game over: this tap only restarts
@@ -1481,7 +1554,7 @@
       if (touches.size === 2) {
         twoTap = { t0: firstDownT, ok: performance.now() - firstDownT <= TAP_LAND_MS, start: pinch,
                    fingers: new Map([...touches].map(([id, p]) => [id, { x: p.x, y: p.y }])), ar: 1, ai: 0, br: 0, bi: 0 };
-        twoHold = { start: pinch, timer: setTimeout(() => { twoHold = null; toggleForces(); }, FORCE_HOLD_MS) };
+        if (simInEdit) twoHold = { start: pinch, timer: setTimeout(() => { twoHold = null; toggleForces(); }, FORCE_HOLD_MS) };   // test sandbox only
       }
     }
   }, opts);
@@ -1489,10 +1562,11 @@
     e.preventDefault();
     for (const t of e.changedTouches) {
       if (touches.has(t.identifier)) touches.set(t.identifier, { x: t.clientX, y: t.clientY });
+      if (mode !== 'edit') continue;
       movePress(t.identifier, t.clientX, t.clientY);
       moveDot(t.identifier, t.clientX, t.clientY);
     }
-    if (pinch && touches.size >= 2) {
+    if (pinch && touches.size >= 2 && mode === 'edit') {
       const now = pinchState();
       let da = now.a - pinch.a;               // twist between frames, kept within ±180°
       if (da > Math.PI) da -= 2 * Math.PI; else if (da < -Math.PI) da += 2 * Math.PI;
@@ -1514,6 +1588,7 @@
     cancelTwoHold();
     if (!cancelled) askTiltPermission();
     for (const t of e.changedTouches) {
+      if (uiTouch && uiTouch.id === t.identifier) { const el = uiTouch.el; uiTouch = null; if (!cancelled) pressButton(el); continue; }
       touches.delete(t.identifier);
       if (restartTap === t.identifier) { restartTap = null; if (!cancelled && player.over) restart(); }
       if (press && press.id === t.identifier) endPress(!cancelled && !gestureUsed);
@@ -1530,14 +1605,19 @@
   const isMouse = (e) => e.pointerType !== 'touch';
   document.addEventListener('pointerdown', (e) => {
     if (!isMouse(e)) return;
+    const ui = uiButton(e);
+    if (ui) { uiMouse = ui; return; }
     mouseHeld = true; cursor = { x: e.clientX, y: e.clientY };
     if (playerOn && player.over) { restartTap = 'm'; tapRun = null; return; }
+    if (mode !== 'edit') return;
     if (onDock(e.clientX, e.clientY)) { tapRun = null; beginDot('m', e.clientX, e.clientY); } else beginPress('m', e.clientX, e.clientY);
   });
   document.addEventListener('pointermove', (e) => { if (isMouse(e)) {
     cursor = e.clientX >= 0 && e.clientY >= 0 && e.clientX <= W && e.clientY <= H ? { x: e.clientX, y: e.clientY } : null; movePress('m', e.clientX, e.clientY); moveDot('m', e.clientX, e.clientY); } });
+  let uiMouse = null;          // the button the mouse went down on
   document.addEventListener('pointerup', (e) => {
     if (!isMouse(e)) return;
+    if (uiMouse) { const el = uiMouse; uiMouse = null; if (uiButton(e) === el) pressButton(el); return; }
     mouseHeld = false;
     askTiltPermission();
     if (restartTap === 'm') { restartTap = null; if (player.over) restart(); return; }
@@ -1550,6 +1630,7 @@
   addEventListener('blur', () => { cursor = null; mouseHeld = false; });
   document.addEventListener('wheel', (e) => {
     e.preventDefault();
+    if (mode !== 'edit') return;           // Play: the view only moves with the player
     const px = playerOn ? W / 2 : e.clientX, py = playerOn ? H / 2 : e.clientY;
     if (e.shiftKey) transformAll(1, px, py, 0, 0, (e.deltaY || e.deltaX) * 0.003); // Shift + scroll rotates
     else transformAll(Math.exp(-e.deltaY * 0.0015), px, py, 0, 0);
@@ -1564,10 +1645,14 @@
     if (k && !mod) { keys.add(k); e.preventDefault(); }
     else if ((e.key === 'Enter' || e.key === ' ') && playerOn && player.over) { restart(); e.preventDefault(); }
     // Keyboard versions of the touch gestures (handy on a laptop, harmless elsewhere).
-    else if ((mod && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) || (e.key === 'Backspace' && !mod)) { undoLast(); e.preventDefault(); }
+    else if (e.key === 'Tab' && !mod && !e.altKey) { setMode(mode === 'edit' ? 'play' : 'edit'); e.preventDefault(); }
+    // Keyboard versions of the touch gestures (Edit only).
+    else if (((mod && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) || (e.key === 'Backspace' && !mod)) && mode === 'edit') { undoLast(); e.preventDefault(); }
     else if (mod || e.altKey || e.repeat) return;
-    else if (e.key === 'f' || e.key === 'F') { toggleForces(); e.preventDefault(); }
-    else if (e.key === 'r' || e.key === 'R') { tapRun = null; resetGame(); e.preventDefault(); }
+    else if (e.key === 'e' || e.key === 'E') { setMode('edit'); e.preventDefault(); }
+    else if (e.key === 'p' || e.key === 'P') { setMode('play'); e.preventDefault(); }
+    else if ((e.key === 'r' || e.key === 'R') && mode === 'edit') { tapRun = null; resetGame(); e.preventDefault(); }
+    else if ((e.key === 'l' || e.key === 'L') && mode === 'edit') { setPencil(!pencil); e.preventDefault(); }
     else if (e.key === 'h' || e.key === 'H' || e.key === '?') { showHint(!hintOn, false); e.preventDefault(); }
   });
   addEventListener('keyup', (e) => { const k = KEY_DIR[e.key]; if (k) keys.delete(k); });
@@ -1579,24 +1664,61 @@
     hintOn = on; hintEl.style.opacity = on ? '1' : '0'; clearTimeout(hintTimer);
     if (on && auto) hintTimer = setTimeout(() => showHint(false, false), 6000);
   }
-  if (laptop) {
-    showHint(true, true);
-    document.querySelector('#over small').textContent = 'Click or press Space to play again';
+  const HINTS = { edit: 'drag to pan · drag objects to move · click colour · hold circle · L pencil · scroll zoom · Ctrl+Z undo · R reset · Tab play',
+                  play: 'move cursor to steer · Tab edit' };
+  if (laptop) document.querySelector('#over small').textContent = 'Click or press Space to play again';
+
+  // ----- Edit / Play -----
+  const modeEls = { edit: document.getElementById('mEdit'), play: document.getElementById('mPlay') };
+  const penEl = document.getElementById('penBtn');
+  function syncPlayer() {
+    playerOn = playerWanted && (mode === 'play' || simInEdit);
+    overEl.style.display = playerOn && player.over ? 'block' : 'none';
+    dirty = true;
   }
+  function setPencil(on) {
+    pencil = !!on; penEl.classList.toggle('on', pencil); penEl.setAttribute('aria-pressed', String(pencil));
+  }
+  function setMode(m) {
+    if (m !== 'edit' && m !== 'play') return;
+    endPress(false); endDot(false); cancelTwoHold(); restartTap = null; tapRun = null; lastTwoTap = null;
+    if (m !== mode) {
+      mode = m;
+      if (mode === 'play') {          // a fresh run on the world as it is
+        forcesOn = true; restart(); keys.clear();
+      } else {                        // freeze where it is
+        forcesOn = false; player.vx = 0; player.vy = 0;
+      }
+      lastT = performance.now();
+    }
+    for (const k in modeEls) modeEls[k].classList.toggle('on', k === mode);
+    penEl.style.display = mode === 'edit' ? '' : 'none';
+    syncPlayer(); showScore();
+    if (laptop) { hintEl.textContent = HINTS[mode]; showHint(true, true); }
+  }
+  function pressButton(el) {
+    if (el.blur) el.blur();
+    if (el === penEl) { if (mode === 'edit') setPencil(!pencil); }
+    else setMode(mode === 'edit' ? 'play' : 'edit');
+  }
+  hintEl.textContent = HINTS.edit;
+  setMode('edit');
 
   // For testing: window.__hue exposes state.
   window.__hue = { circles, strokes, dots, hunters, chasers, spawners, pops, history, transformAll,
     // test hooks: add a hunter / chaser directly (the corners now place spawners)
-    addHunter(x, y, r = HUNTER_R) { const h = { cx: x, cy: y, r, popCount: 0 }; hunters.push(h); history.push({ type: 'hunter', obj: h }); return h; },
-    addChaser(x, y, r = CHASER_R) { const c = { cx: x, cy: y, r }; chasers.push(c); history.push({ type: 'chaser', obj: c }); return c; }, get dock() { return { x: dockX, y: dockY, r: DOT_R }; },
-    get redDock() { return { x: redX, y: redY, r: HUNTER_R }; }, get blueDock() { return { x: blueX, y: blueY, r: CHASER_R }; }, get hue() { return hue; }, set hue(h) { hue = h; paint(); }, get forcesOn() { return forcesOn; },
+    addHunter, addChaser, get dock() { return { x: dockX, y: dockY, r: DOT_R }; },
+    get redDock() { return { x: redX, y: redY, r: HUNTER_R }; }, get blueDock() { return { x: blueX, y: blueY, r: CHASER_R }; },
+    get redSpawnerDock() { return { x: redX, y: redY - DOCK_GAP, r: SPAWNER_R }; }, get blueSpawnerDock() { return { x: blueX, y: blueY + DOCK_GAP, r: SPAWNER_R }; },
+    get mode() { return mode; }, set mode(m) { setMode(m); }, get pencil() { return pencil; }, set pencil(v) { setPencil(v); },
+    get simInEdit() { return simInEdit; }, set simInEdit(v) { simInEdit = !!v; syncPlayer(); }, set forcesOn(v) { forcesOn = !!v; }, get hue() { return hue; }, set hue(h) { hue = h; paint(); }, get forcesOn() { return forcesOn; },
     get player() { return { x: W / 2, y: H / 2, r: player.r, eaten: player.eaten, score: player.score, caught: player.caught, size: player.size, gameOver: player.over,
       invulnerable: invulnerable(performance.now()), huntSafe: huntSafe(performance.now()), guard: player.guard, scale: player.scale, vx: player.vx, vy: player.vy,
       tilt: [tiltX, tiltY], neutral: neutral && [neutral.beta, neutral.gamma], on: playerOn }; },
     emitStats, resetGame, spawnWait, SPAWNER_MEAN_S, laptop, get cursor() { return cursor; }, get mouseHeld() { return mouseHeld; },
     get steering() { return steering; }, get hintOn() { return hintOn; },
     playerObj: player, setTilt: onTilt, restart,
-    get playerOn() { return playerOn; }, set playerOn(v) { playerOn = !!v; dirty = true; overEl.style.display = playerOn && player.over ? 'block' : 'none'; } };
+    get playerOn() { return playerOn; }, set playerOn(v) { playerWanted = !!v; syncPlayer(); } };
 </script>
 <script src="hud.js"></script>
 </body>
