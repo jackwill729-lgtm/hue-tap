@@ -29,6 +29,9 @@
   #modeBtn span.on{background:#fff;color:#222;opacity:1}
   #penBtn{position:absolute;right:calc(100% + 8px);top:50%;transform:translateY(-50%);width:34px;height:34px;border-radius:17px;background:rgba(0,0,0,.35);font-size:17px!important;padding:0}
   #penBtn.on{background:#fff;color:#222!important;box-shadow:0 0 0 2px rgba(0,0,0,.25)}
+  #diceBtn{position:absolute;left:50%;top:calc(100% + 8px);transform:translateX(-50%);width:32px;height:32px;border-radius:16px;background:rgba(0,0,0,.35);font-size:18px!important;padding:0;line-height:32px!important}
+  #fps{position:fixed;left:50%;bottom:calc(6px + env(safe-area-inset-bottom));transform:translateX(-50%);font:500 11px/1 -apple-system,system-ui,sans-serif;
+    color:rgba(255,255,255,.7);text-shadow:0 0 3px rgba(0,0,0,.45);pointer-events:none;z-index:2;white-space:nowrap}
   #hint{position:fixed;left:50%;bottom:calc(68px + env(safe-area-inset-bottom));transform:translateX(-50%);max-width:calc(100% - 140px);
     text-align:center;font:500 13px/1.45 -apple-system,system-ui,sans-serif;color:#fff;background:rgba(0,0,0,.35);padding:8px 14px;
     border-radius:16px;opacity:0;transition:opacity .5s;pointer-events:none;width:max-content}
@@ -39,7 +42,8 @@
 <canvas id="o"></canvas>
 <div id="toast"></div>
 <div id="score"></div>
-<div id="bar"><button id="penBtn" title="Pencil: drag draws lines (L)" aria-pressed="false">✎</button><button id="modeBtn" title="Switch Edit / Play (Tab)"><span id="mEdit" class="on">Edit</span><span id="mPlay">Play</span></button></div>
+<div id="bar"><button id="penBtn" title="Pencil: drag draws lines (L)" aria-pressed="false">✎</button><button id="modeBtn" title="Switch Edit / Play (Tab)"><span id="mEdit" class="on">Edit</span><span id="mPlay">Play</span></button><button id="diceBtn" title="Scatter random spawners over the world (X)" aria-label="Random spawners">🎲</button></div>
+<div id="fps"></div>
 <div id="hint"></div>
 <div id="over"><b>Game over</b><span id="overScore"></span><small>Tap to play again</small></div>
 <div id="safe" style="position:fixed;visibility:hidden;pointer-events:none;padding-left:env(safe-area-inset-left,0px);padding-right:env(safe-area-inset-right,0px);padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)"></div>
@@ -136,9 +140,10 @@
   // Blue chasers dragged out of the top corner: they go after hunters.
   const chasers = [];  // {cx, cy, r} or the big form
   // The player: a white dot pinned to the screen centre. Tilting moves the world
-  // the other way, so the dot seems to travel. It never changes size (apart from
-  // zooming): eating a smaller circle scores a point, a hunter catching it costs 5,
-  // and a bigger circle covering it ends the game. invUntil = end of the blinking
+  // the other way, so the dot seems to travel. Eating a smaller circle grows it by a
+  // tenth of that circle's radius, a hunter catching it shrinks it by 15%, and a
+  // bigger circle covering it ends the game. The reading at the top is its size as a
+  // % of its start size (no points); in Play the view zooms to keep it 12 px on screen. invUntil = end of the blinking
   // safe time after a restart; huntSafeUntil = end of the 1 s safe time after a catch.
   // Two modes. Edit: a level editor with the world frozen (navigate, place and move
   // things). Play: the world runs, the player dot appears and the game rules apply.
@@ -150,11 +155,19 @@
   // scale = zoom since the player (re)started, so its speed scales with zoom like a hunter's;
   // guard = after a restart, stay safe until no bigger circle covers the player.
   // size is always 1 (kept for anything reading the old field).
-  const player = { cx: 0, cy: 0, r: PLAYER_R, scale: 1, eaten: 0, score: 0, caught: 0, size: 1, over: false, invUntil: 0, guard: false, huntSafeUntil: 0, vx: 0, vy: 0 };
+  const player = { cx: 0, cy: 0, r: PLAYER_R, scale: 1, eaten: 0, peak: 1, caught: 0, size: 1, sizeT: 0, over: false, invUntil: 0, guard: false, huntSafeUntil: 0, vx: 0, vy: 0 };
   const history = [];  // circles, lines, dots, hunters and chasers in the order they were made, for undo
   function undoLast() {
     while (history.length) {
       const item = history.pop();
+      if (item.type === 'batch') {             // the random spawners: one press, one undo
+        let n = 0;
+        for (const it of item.items) { const l = it.type === 'dot' ? dots : spawners, i = l.indexOf(it.obj); if (i >= 0) { l.splice(i, 1); n++; } }
+        if (!n) continue;
+        dirty = true; toast('Removed random spawners');
+        if (navigator.vibrate) navigator.vibrate(10);
+        return;
+      }
       const list = { circle: circles, dot: dots, hunter: hunters, chaser: chasers, line: strokes,
                      hunterSpawner: spawners, chaserSpawner: spawners }[item.type];
       const i = list.indexOf(item.obj);
@@ -1244,7 +1257,9 @@
   function movePlayer(dt, now) {
     finishCalib(now);                  // in case the sensor only reports changes
     let vx = 0, vy = 0;
-    const MAX = TILT_MAX_RADII * PLAYER_R * player.scale;   // scales with zoom, not with growth
+    // Play: the same speed on screen whatever the size (the view zooms with the player,
+    // so in the world it's faster the bigger it is). Test sandbox: scales with zoom only.
+    const MAX = TILT_MAX_RADII * PLAYER_R * (mode === 'play' ? 1 : player.scale);
     if (playerOn && !player.over && isFinite(MAX)) {
       const m = Math.hypot(tiltX, tiltY);
       if (m > TILT_DEAD) {
@@ -1281,6 +1296,22 @@
     const dx = pBody.cx - W / 2, dy = pBody.cy - H / 2;
     if (dx || dy) transformAll(1, 0, 0, -dx, -dy);
   }
+  // Play: the view zooms with the player's size so it settles back to its start size
+  // (12 px) on screen. Growing is deliberately laggy: the player visibly grows first,
+  // then after a short pause the world eases out about it. (A catch's shrink zooms
+  // back in at once, in catchStep; this eases in too if it's ever left small.) Zoom-out stops at the
+  // world-covers-screen limit; past that the player just looks bigger.
+  const SIZE_ZOOM_DELAY_MS = 300;   // pause after a size change before the view follows
+  const SIZE_ZOOM_S = 1.5;          // then an exponential ease with this time constant
+  function sizeZoom(dt, now) {
+    if (mode !== 'play' || !playerOn || player.over || !(player.r > 0) || !isFinite(player.r)) return;
+    if (now - player.sizeT < SIZE_ZOOM_DELAY_MS) return;
+    const want = PLAYER_R / player.r;
+    if (Math.abs(Math.log(want)) < 1e-6) return;
+    if (want < 1 && worldOn && world.s <= minScale() * (1 + 1e-9)) return;    // at the zoom-out limit
+    const k = Math.pow(want, 1 - Math.exp(-dt / SIZE_ZOOM_S));
+    transformAll(Math.abs(Math.log(want)) < 1e-3 ? want : k, W / 2, H / 2, 0, 0);
+  }
   // Eat smaller circles more than half covered; a bigger circle covering more than
   // half of the player ends the game (and clones itself, like any eater).
   function playerStep(now) {
@@ -1298,9 +1329,11 @@
       if (d2 >= P * P) continue;
       const d = Math.sqrt(d2);
       if (d + c.r > P && lensFrac(P, c.r, d) <= 0.5) continue;
-      player.eaten++; player.score++;             // a point per circle
+      player.eaten++;
       player.r += 0.1 * c.r;                      // and grows by a tenth of what it ate (speed stays in start radii)
       player.size = player.r / (PLAYER_R * player.scale);
+      if (player.size > player.peak) player.peak = player.size;
+      player.sizeT = now;                         // the view follows after a pause
       (gone || (gone = new Set())).add(c);
       pops.push({ x: c.cx, y: c.cy, r: c.r, color: '#FFFFFF', t0: now });
     }
@@ -1350,9 +1383,9 @@
     gameOver(now, killer.color || '#FFFFFF');
   }
   // Any hunter touching the player catches it, whatever it was chasing: the hunter
-  // is destroyed, the player loses 5 points (never below 0), shrinks by 15% (not
+  // is destroyed, the player shrinks by 15% (not
   // below half its start size) and is safe from hunters for 1 s. A catch never ends the game.
-  const CATCH_COST = 5, CATCH_SAFE_MS = 1000;
+  const CATCH_SAFE_MS = 1000;
   const CATCH_SHRINK = 0.15;    // a catch takes this fraction off the player's radius ...
   const CATCH_MIN_SIZE = 0.5;   // ... but never below this fraction of the start radius
   const huntSafe = (now) => now < player.huntSafeUntil;
@@ -1367,12 +1400,14 @@
       hunters.splice(i, 1);
       const k = history.findIndex(it => it.obj === h); if (k >= 0) history.splice(k, 1);
       pops.push({ x: h.cx, y: h.cy, r: h.r * 1.5, color: '#ff2a2a', t0: now });
-      player.score = Math.max(0, player.score - CATCH_COST); player.caught++;
+      player.caught++;
       // ... and shrinks the player by 15% of its size, never below half its start size.
       const oldR = player.r, floor = CATCH_MIN_SIZE * PLAYER_R * player.scale;
       player.r = Math.max(Math.min(oldR, floor), oldR * (1 - CATCH_SHRINK));
       player.size = player.r / (PLAYER_R * player.scale);
       if (player.r < oldR) pops.push({ x: W / 2, y: H / 2, r: oldR / 1.6, color: '#ff2a2a', t0: now });   // a red ring closing in
+      // Play: shrinking zooms the view in at once (unlike growing), so it keeps its size on screen.
+      if (mode === 'play' && player.r < oldR) transformAll(oldR / player.r, W / 2, H / 2, 0, 0);
       player.huntSafeUntil = now + CATCH_SAFE_MS;
       dirty = true;
       if (navigator.vibrate) navigator.vibrate([30, 30, 30]);
@@ -1381,8 +1416,9 @@
   }
   const scoreEl = document.getElementById('score'), overEl = document.getElementById('over');
   let shownScore = null;
+  const sizePct = () => Math.round(player.size * 100);   // the reading: size as a % of the start size
   function showScore() {
-    const t = playerOn ? 'Score ' + player.score : '';
+    const t = playerOn ? sizePct() + '%' : '';
     if (t !== shownScore) { scoreEl.textContent = t; shownScore = t; }
   }
   function gameOver(now, color) {
@@ -1390,13 +1426,13 @@
     for (const h of hunters) if (h.target === player) h.target = null;
     pops.push({ x: W / 2, y: H / 2, r: Math.min(player.r, 4 * Math.hypot(W, H)) * 1.5, color, t0: now });
     document.getElementById('overScore').textContent =
-      `Score ${player.score} · ate ${player.eaten} · caught ${player.caught}×`;
+      `Size ${sizePct()}% · peak ${Math.round(player.peak * 100)}% · ate ${player.eaten} · caught ${player.caught}×`;
     overEl.style.display = 'block';
     dirty = true;
     if (navigator.vibrate) navigator.vibrate([40, 40, 120]);
   }
   function restart() {
-    Object.assign(player, { r: PLAYER_R, scale: 1, eaten: 0, score: 0, caught: 0, size: 1, over: false, vx: 0, vy: 0, guard: true, covered: false, huntSafeUntil: 0,
+    Object.assign(player, { r: PLAYER_R, scale: 1, eaten: 0, peak: 1, caught: 0, size: 1, sizeT: 0, over: false, vx: 0, vy: 0, guard: true, covered: false, huntSafeUntil: 0,
                             invUntil: performance.now() + INVULN_MS });
     neutral = null; calib = null; tiltX = 0; tiltY = 0;   // the next 0.3 s of readings set the new neutral pose
     overEl.style.display = 'none';
@@ -1420,8 +1456,22 @@
     ctx.restore();
   }
 
+  // Frames per second, centred at the bottom: counted over ~0.5 s, lightly smoothed.
+  const fpsEl = document.getElementById('fps');
+  let fpsN = 0, fpsT0 = performance.now(), fps = 0;
+  function countFrame() {
+    fpsN++;
+    const t = performance.now(), span = t - fpsT0;
+    if (span < 500) return;
+    const cur = fpsN * 1000 / span;
+    fps = fps ? fps * 0.5 + cur * 0.5 : cur;
+    fpsN = 0; fpsT0 = t;
+    fpsEl.textContent = Math.round(fps) + ' fps';
+  }
+
   let dirty = true;
   function draw(now) {
+    countFrame();
     now = now || performance.now();
     const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
     const tFrame = performance.now();   // the physics budget includes working out who flees
@@ -1449,6 +1499,7 @@
     player.cx = W / 2; player.cy = H / 2;
     if (live) {
       if (dt > 0) movePlayer(dt, now);
+      if (dt > 0) sizeZoom(dt, now);
       if (dt > 0) dotFlee(dt, now);
       eatStep();
       playerStep(now);
@@ -1686,6 +1737,48 @@
     else tapRun = { n: 1, x, y, end: now };
     if (tapRun.n >= 3) { tapRun = null; resetGame(); }
   }
+  // Edit: scatter 12 black dots, 4 hunter spawners and 4 chaser spawners at random
+  // over the whole looping world (not just the screen), clear of everything already
+  // there, of the player's start in the middle and of each other. Adds to what's
+  // there; one undo removes the whole batch.
+  const RANDOM_SET = [['dot', 12], ['hunterSpawner', 4], ['chaserSpawner', 4]];
+  const RANDOM_GAP = 40;       // px of clear space around each new one (more round the player's start)
+  function randomSpawners() {
+    if (mode !== 'edit') return;
+    updateWrap();
+    const PX = WON ? PXv : WORLD_SCREENS * W, PY = WON ? PYv : WORLD_SCREENS * H, sx = W / 2, sy = H / 2;
+    const taken = [];                      // [x, y, r] of everything to keep clear of
+    for (const c of circles.concat(dots, spawners, hunters, chasers)) if (!c.big && c.r > 0 && isFinite(c.cx) && isFinite(c.cy)) taken.push([c.cx, c.cy, c.r]);
+    for (const st of strokes) for (let i = 0; i + 1 < st.pts.length; i += 2) taken.push([st.pts[i], st.pts[i + 1], st.w]);
+    taken.push([sx, sy, Math.max(player.r, PLAYER_R) + 80]);   // the player's start
+    const clear = (x, y, r) => {
+      let worst = Infinity;
+      for (const [tx, ty, tr] of taken) { mi(x - tx, y - ty); const g = Math.hypot(MX, MY) - r - tr; if (g < worst) worst = g; }
+      return worst;
+    };
+    const items = [];
+    for (const [kind, n] of RANDOM_SET) for (let k = 0; k < n; k++) {
+      const r = kind === 'dot' ? DOT_R : SPAWNER_R;
+      let best = null, bestG = -Infinity;
+      for (let tries = 0; tries < 80; tries++) {   // the first spot with room, else the roomiest one tried
+        const u = (Math.random() - 0.5) * PX, v = (Math.random() - 0.5) * PY;
+        const x = sx + u * C1 - v * S1, y = sy + u * S1 + v * C1, g = clear(x, y, r);
+        if (g > bestG) { bestG = g; best = [x, y]; }
+        if (g >= RANDOM_GAP) break;
+      }
+      const [x, y] = best;
+      let o;
+      if (kind === 'dot') { o = { cx: x, cy: y, r, wait: emitWait() }; dots.push(o); }
+      else { o = { cx: x, cy: y, r, kind: kind === 'hunterSpawner' ? 'hunter' : 'chaser', wait: spawnWait() }; spawners.push(o); }
+      items.push({ type: kind, obj: o });
+      taken.push([x, y, r]);
+    }
+    history.push({ type: 'batch', items });
+    dirty = true;
+    toast('Added random spawners');
+    if (navigator.vibrate) navigator.vibrate(15);
+  }
+
   // Back to a fresh start, as if the page had just loaded.
   function resetGame() {
     for (const a of [circles, strokes, dots, spawners, hunters, chasers, pops, history, fleeing]) a.length = 0;
@@ -1694,7 +1787,7 @@
     cancelTwoHold(); lastTwoTap = null; restartTap = null;
     if (dotDrag) dotDrag = null;
     hue = Math.floor(Math.random() * 360); paint();
-    restart();                       // player in the middle, score 0, immune for a moment, tilt re-calibrates
+    restart();                       // player in the middle, 100%, immune for a moment, tilt re-calibrates
     recentreWorld();                 // same world size; its guide edges laid out around the view again
     dirty = true;
     toast('Game reset');
@@ -1902,6 +1995,7 @@
     else if (e.key === 'p' || e.key === 'P') { setMode('play'); e.preventDefault(); }
     else if ((e.key === 'r' || e.key === 'R') && mode === 'edit') { tapRun = null; resetGame(); e.preventDefault(); }
     else if ((e.key === 'l' || e.key === 'L') && mode === 'edit') { setPencil(!pencil); e.preventDefault(); }
+    else if ((e.key === 'x' || e.key === 'X') && mode === 'edit') { randomSpawners(); e.preventDefault(); }
     else if (e.key === 'h' || e.key === 'H' || e.key === '?') { showHint(!hintOn, false); e.preventDefault(); }
   });
   addEventListener('keyup', (e) => { const k = KEY_DIR[e.key]; if (k) keys.delete(k); });
@@ -1913,13 +2007,13 @@
     hintOn = on; hintEl.style.opacity = on ? '1' : '0'; clearTimeout(hintTimer);
     if (on && auto) hintTimer = setTimeout(() => showHint(false, false), 6000);
   }
-  const HINTS = { edit: 'drag to pan · drag objects to move · click colour · hold circle · L pencil · scroll zoom · Ctrl+Z undo · R reset · Tab play',
+  const HINTS = { edit: 'drag to pan · drag objects to move · click colour · hold circle · L pencil · X random spawners · scroll zoom · Ctrl+Z undo · R reset · Tab play',
                   play: 'move cursor to steer · click to change background · Tab edit' };
   if (laptop) document.querySelector('#over small').textContent = 'Click or press Space to play again';
 
   // ----- Edit / Play -----
   const modeEls = { edit: document.getElementById('mEdit'), play: document.getElementById('mPlay') };
-  const penEl = document.getElementById('penBtn');
+  const penEl = document.getElementById('penBtn'), diceEl = document.getElementById('diceBtn');
   function syncPlayer() {
     playerOn = playerWanted && (mode === 'play' || simInEdit);
     overEl.style.display = playerOn && player.over ? 'block' : 'none';
@@ -1942,12 +2036,14 @@
     }
     for (const k in modeEls) modeEls[k].classList.toggle('on', k === mode);
     penEl.style.display = mode === 'edit' ? '' : 'none';
+    diceEl.style.display = mode === 'edit' ? '' : 'none';   // in Play the size reading sits there
     syncPlayer(); showScore();
     if (laptop) { hintEl.textContent = HINTS[mode]; showHint(true, true); }
   }
   function pressButton(el) {
     if (el.blur) el.blur();
-    if (el === penEl) { if (mode === 'edit') setPencil(!pencil); }
+    if (el === diceEl) randomSpawners();
+    else if (el === penEl) { if (mode === 'edit') setPencil(!pencil); }
     else setMode(mode === 'edit' ? 'play' : 'edit');
   }
   hintEl.textContent = HINTS.edit;
@@ -1962,7 +2058,7 @@
     get mode() { return mode; }, set mode(m) { setMode(m); }, get pencil() { return pencil; }, set pencil(v) { setPencil(v); },
     get fleeRange() { return FLEE_RANGE; }, set fleeRange(v) { FLEE_RANGE = +v; },
     get simInEdit() { return simInEdit; }, set simInEdit(v) { simInEdit = !!v; syncPlayer(); }, set forcesOn(v) { forcesOn = !!v; }, get hue() { return hue; }, set hue(h) { hue = h; paint(); }, get forcesOn() { return forcesOn; },
-    get player() { return { x: W / 2, y: H / 2, r: player.r, eaten: player.eaten, score: player.score, caught: player.caught, size: player.size, gameOver: player.over,
+    get player() { return { x: W / 2, y: H / 2, r: player.r, eaten: player.eaten, score: sizePct(), peak: Math.round(player.peak * 100), caught: player.caught, size: player.size, gameOver: player.over,
       invulnerable: invulnerable(performance.now()), huntSafe: huntSafe(performance.now()), guard: player.guard, scale: player.scale, vx: player.vx, vy: player.vy,
       tilt: [tiltX, tiltY], neutral: neutral && [neutral.beta, neutral.gamma], on: playerOn }; },
     emitStats, resetGame, spawnWait, SPAWNER_MEAN_S, laptop, get cursor() { return cursor; }, get mouseHeld() { return mouseHeld; },
@@ -1972,7 +2068,7 @@
     // the wrapping world: size in load px, scale, angle, guide origin; period on screen now
     get world() { updateWrap(); return { WX: world.WX, WY: world.WY, s: world.s, a: world.a, ox: world.ox, oy: world.oy, PX: PXv, PY: PYv, wrapping: WON, minScale: minScale() }; },
     get worldOn() { return worldOn; }, set worldOn(v) { worldOn = !!v; updateWrap(); },   // test hook: off = the old unbounded plane
-    wrapNow: wrapAll, DOT_FLEE_RANGE, DOT_FLEE_SPEED };
+    wrapNow: wrapAll, DOT_FLEE_RANGE, DOT_FLEE_SPEED, randomSpawners, get fps() { return fps; } };
 </script>
 <script src="hud.js"></script>
 </body>
