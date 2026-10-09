@@ -135,6 +135,8 @@
   const spawners = [];  // {cx, cy, r, kind: 'hunter' | 'chaser', wait} or the big form
   function addHunter(x, y, r = HUNTER_R) { const h = { cx: x, cy: y, r, popCount: 0 }; hunters.push(h); history.push({ type: 'hunter', obj: h }); return h; }
   function addChaser(x, y, r = CHASER_R) { const c = { cx: x, cy: y, r }; chasers.push(c); history.push({ type: 'chaser', obj: c }); return c; }
+  const CHASER_EVERY = 3;     // a chaser comes out for every this many spawned hunters
+  let spawnedHunters = 0;     // hunters born this run: spawner releases and clones (not dock-placed)
   const spawnWait = () => -Math.log(1 - Math.random()) * SPAWNER_MEAN_S;
   // Red hunters dragged out of the other corner: same small/big forms as circles.
   // Each one chases the nearest circle and pops it.
@@ -699,22 +701,35 @@
       circles.push(c);
       history.push({ type: 'circle', obj: c });
     }
-    // Spawners: same rule, slower (hunters also clone themselves), releasing a
-    // hunter or chaser 0.8x the spawner's size just off its centre.
+    // Hunter spawners: same rule, slower (hunters also clone themselves), releasing a
+    // hunter 0.8x the spawner's size just off its centre. Chaser spawners have no timer
+    // of their own: see hunterBorn.
     for (const sp of spawners) {
+      if (sp.kind !== 'hunter') continue;
       sp.wait -= dt;
       if (sp.wait > 0) continue;
       sp.wait = spawnWait();
-      const ok = sp.big ? isFinite(sp.ox) && isFinite(sp.oy) : isFinite(sp.cx) && isFinite(sp.cy);
-      if (!ok || !isFinite(sp.r)) continue;
-      const r = sp.r * SPAWN_R, a = Math.random() * Math.PI * 2, off = sp.r * 0.3 * Math.random();
-      const o = sp.big
-        ? { big: true, ox: sp.ox + sp.nx * (sp.r - r), oy: sp.oy + sp.ny * (sp.r - r), nx: sp.nx, ny: sp.ny, r }   // huge: same centre
-        : { cx: sp.cx + Math.cos(a) * off, cy: sp.cy + Math.sin(a) * off, r };
-      if (sp.kind === 'hunter') { o.popCount = 0; hunters.push(o); } else chasers.push(o);
-      history.push({ type: sp.kind, obj: o });
-      emitStats[sp.kind]++;
+      if (release(sp)) hunterBorn();
     }
+  }
+  // Every 3rd hunter born (3, 6, 9 ...: spawner releases and clones; dock-placed ones
+  // don't count) brings one chaser out of a chaser spawner picked at random, if any.
+  function hunterBorn() {
+    if (++spawnedHunters % CHASER_EVERY !== 0) return;
+    const cs = spawners.filter((c) => c.kind === 'chaser' && spawnerOk(c));
+    if (cs.length) release(cs[Math.floor(Math.random() * cs.length)]);
+  }
+  const spawnerOk = (sp) => (sp.big ? isFinite(sp.ox) && isFinite(sp.oy) : isFinite(sp.cx) && isFinite(sp.cy)) && isFinite(sp.r);
+  function release(sp) {
+    if (!spawnerOk(sp)) return false;
+    const r = sp.r * SPAWN_R, a = Math.random() * Math.PI * 2, off = sp.r * 0.3 * Math.random();
+    const o = sp.big
+      ? { big: true, ox: sp.ox + sp.nx * (sp.r - r), oy: sp.oy + sp.ny * (sp.r - r), nx: sp.nx, ny: sp.ny, r }   // huge: same centre
+      : { cx: sp.cx + Math.cos(a) * off, cy: sp.cy + Math.sin(a) * off, r };
+    if (sp.kind === 'hunter') { o.popCount = 0; hunters.push(o); } else chasers.push(o);
+    history.push({ type: sp.kind, obj: o });
+    emitStats[sp.kind]++;
+    return true;
   }
 
   // Fill a circle (small or big form), skipping it if it's off screen.
@@ -1070,7 +1085,7 @@
         tgt = null;
       }
     }
-    for (const c of born) { hunters.push(c); history.push({ type: 'hunter', obj: c }); }
+    for (const c of born) { hunters.push(c); history.push({ type: 'hunter', obj: c }); hunterBorn(); }   // clones count towards chasers
     if (!popped) return;
     let w = 0;
     for (const c of circles) if (!popped.has(c)) circles[w++] = c;
@@ -1438,6 +1453,7 @@
     if (navigator.vibrate) navigator.vibrate([40, 40, 120]);
   }
   function restart() {
+    spawnedHunters = 0;              // a fresh run: the chaser count starts again
     Object.assign(player, { r: PLAYER_R, scale: 1, eaten: 0, peak: 1, caught: 0, size: 1, sizeT: 0, over: false, vx: 0, vy: 0, guard: true, covered: false, huntSafeUntil: 0,
                             invUntil: performance.now() + INVULN_MS });
     neutral = null; calib = null; tiltX = 0; tiltY = 0;   // the next 0.3 s of readings set the new neutral pose
@@ -1804,6 +1820,7 @@
     forcesOn = mode === 'play';
     cancelTwoHold(); lastTwoTap = null; restartTap = null;
     if (dotDrag) dotDrag = null;
+    spawnedHunters = 0;
     setRun(false);                   // Edit's world paused again
     hue = Math.floor(Math.random() * 360); paint();
     restart();                       // player in the middle, 100%, immune for a moment, tilt re-calibrates
@@ -2101,7 +2118,7 @@
     get world() { updateWrap(); return { WX: world.WX, WY: world.WY, s: world.s, a: world.a, ox: world.ox, oy: world.oy, PX: PXv, PY: PYv, wrapping: WON, minScale: minScale() }; },
     get worldOn() { return worldOn; }, set worldOn(v) { worldOn = !!v; updateWrap(); },   // test hook: off = the old unbounded plane
     wrapNow: wrapAll, DOT_FLEE_RANGE, DOT_FLEE_SPEED, randomSpawners, get fps() { return fps; }, DOT_AGE_S,
-    get editRun() { return editRun; }, set editRun(v) { setRun(v); }, toggleRun };
+    get spawnedHunters() { return spawnedHunters; }, set spawnedHunters(v) { spawnedHunters = +v; }, CHASER_EVERY, get editRun() { return editRun; }, set editRun(v) { setRun(v); }, toggleRun };
 </script>
 <script src="hud.js"></script>
 </body>
