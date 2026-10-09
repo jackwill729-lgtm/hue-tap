@@ -58,7 +58,8 @@
 #huehud .cnt span{display:flex;align-items:center;gap:3px}
 #huehud .dot{width:8px;height:8px;border-radius:50%;box-sizing:border-box;border:1px solid rgba(255,255,255,.85)}
 #huehud .dot.r{background:#e8322e}#huehud .dot.b{background:#2e6be8}#huehud .dot.k{background:#000}
-#huehud .dot.c{background:transparent;border:1.5px solid #fff}`;
+#huehud .dot.c{background:transparent;border:1.5px solid #fff}
+.muted #huehud .dot.r{background:#f2968c}.muted #huehud .dot.b{background:#8cb2f0}.muted #huehud .dot.k{background:#464a50}`;
 
   let root = null, el = {};
   function build() {
@@ -123,12 +124,14 @@
 
   // ---- Render (only touches the DOM when something changed) -----------------
   let shown = '';
-  const col = (h) => `hsl(${h},70%,55%)`;
+  // v40: pastel when the game's muted theme is on (<html class="muted">)
+  const isMuted = () => document.documentElement.classList.contains('muted');
+  const col = (h) => isMuted() ? `hsl(${h},45%,78%)` : `hsl(${h},70%,55%)`;
   function render() {
     if (!stats.ok) { if (root) root.classList.remove('on'); shown = ''; return; }
     const d = stats.dominant;
     const key = [d ? d.hue + d.name + Math.round(d.share * 100) : '-', stats.top.map((t) => t.bin + ':' + Math.round(t.share * 100)).join(','),
-                 stats.hunters, stats.chasers, stats.emitters, stats.circles, config.showEmitters].join('|');
+                 stats.hunters, stats.chasers, stats.emitters, stats.circles, config.showEmitters, isMuted()].join('|');
     if (key !== shown) {
       shown = key;
       el.sw.style.background = d ? col(d.hue) : 'transparent';
