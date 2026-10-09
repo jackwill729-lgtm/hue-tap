@@ -61,6 +61,10 @@
   let FLEE_RANGE = 12;         // hunters run from chasers closer than this many hunter radii (tests may set 0)
   const POP_S = 0.25;          // length of the pop animation
   const CLONE_EVERY = 20;      // a hunter clones itself every this many pops
+  const DOT_FLEE_RANGE = 150;  // black dots run from anything whose edge is within this (px at the starting zoom)
+  const DOT_FLEE_SPEED = 100;  // their top speed, px/s at the starting zoom: about a fleeing coloured circle's
+  const DOT_DAMPING = 2.5;     // per second, so they settle soon after the danger has gone
+  const DOT_OWN_MS = 1000;     // a dot ignores circles it released this recently
   const EMIT_MEAN_S = 1.2;     // average time between circles from one dot while forces are on
   const FRAME_BUDGET_MS = 12;  // physics time per frame; beyond this the simulation slows rather than freezes
   const SPAWNER_R = 10;        // red / blue spawners dragged from the corners, in screen pixels
@@ -228,6 +232,11 @@
   // Rotate everything by angle a (radians) and scale by k around screen point
   // (px, py), then move by (dx, dy).
   function transformAll(k, px, py, dx, dy, a = 0) {
+    // Zooming out stops once the world just fills the screen (zooming in has no limit).
+    if (worldOn && k < 1 && world.s * k < minScale()) k = Math.min(1, minScale() / world.s);
+    world.s *= k; world.a += a;
+    { const x = world.ox - px, y = world.oy - py, c = Math.cos(a) * k, s = Math.sin(a) * k;
+      world.ox = px + x * c - y * s + dx; world.oy = py + x * s + y * c + dy; }
     const cos = Math.cos(a) * k, sin = Math.sin(a) * k;
     const cs = Math.cos(a), sn = Math.sin(a);
     for (const c of circles.concat(dots, hunters, chasers, spawners)) {
@@ -255,6 +264,7 @@
       st.w *= k; st.box = null;
     }
     normalise();
+    updateWrap();
     dirty = true;
   }
 
@@ -286,6 +296,79 @@
     }
   }
 
+  // ----- The world: a torus six screens wide and six screens tall -----
+  // Its size is fixed at load (6 × the screen at zoom 1) and it scales and turns with
+  // the view, so it's always the same size relative to everything in it. There are
+  // no walls: whatever leaves one edge comes back on the opposite one, and every
+  // interaction (forces, bumps, eating, hunting, fleeing, lines) takes the short way
+  // round. Each frame, everything is wrapped into the world-sized box centred on the
+  // view, so what's on screen is always continuous; things near that box's edge are
+  // also drawn on the far side. Zooming out stops once the world fills the screen.
+  const WORLD_SCREENS = 6;       // the world is this many screens across, each way
+  const WRAP_MAX = 1e12;         // deep zoom: wrapping pauses once the world is this many px across
+  let worldOn = true;            // test hook: off = the old unbounded plane
+  const world = { WX: 0, WY: 0, s: 1, a: 0, ox: 0, oy: 0 };   // size (load px), scale, angle, guide origin
+  let WON = false, PXv = 0, PYv = 0, HPX = 0, HPY = 0, C1 = 1, S1 = 0, MX = 0, MY = 0;
+  function initWorld() { world.WX = WORLD_SCREENS * W; world.WY = WORLD_SCREENS * H; world.s = 1; world.a = 0; recentreWorld(); }
+  // The dashed guide (Edit) marks the edges of the world as first laid out around the view.
+  function recentreWorld() {
+    const c = Math.cos(world.a), s = Math.sin(world.a), hx = world.WX * world.s / 2, hy = world.WY * world.s / 2;
+    world.ox = W / 2 - hx * c + hy * s; world.oy = H / 2 - hx * s - hy * c;
+  }
+  const minScale = () => Math.hypot(W, H) / Math.min(world.WX, world.WY);   // the world must cover the screen diagonal
+  function updateWrap() {
+    PXv = world.WX * world.s; PYv = world.WY * world.s;
+    WON = worldOn && PXv > 0 && PYv > 0 && PXv < WRAP_MAX && PYv < WRAP_MAX;
+    HPX = PXv / 2; HPY = PYv / 2; C1 = Math.cos(world.a); S1 = Math.sin(world.a);
+  }
+  // Shortest wrapped version of the screen vector (dx, dy), into MX, MY.
+  function mi(dx, dy) {
+    MX = dx; MY = dy;
+    if (!WON) return;
+    let u = dx * C1 + dy * S1, v = dy * C1 - dx * S1;
+    if (u <= HPX && u >= -HPX && v <= HPY && v >= -HPY) return;
+    u -= PXv * Math.round(u / PXv); v -= PYv * Math.round(v / PYv);
+    MX = u * C1 - v * S1; MY = u * S1 + v * C1;
+  }
+  // Where else something at (x, y) reaching r must be drawn (or looked for): the
+  // shifts to its copies across the box edges, if it's that close to them.
+  const NO_GHOSTS = [];
+  function ghostOffsets(x, y, r) {
+    if (!WON) return NO_GHOSTS;
+    const dx = x - W / 2, dy = y - H / 2, u = dx * C1 + dy * S1, v = dy * C1 - dx * S1;
+    const us = [], vs = [0];
+    if (u + r > HPX) us.push(-PXv); if (u - r < -HPX) us.push(PXv);
+    if (v + r > HPY) vs.push(-PYv); if (v - r < -HPY) vs.push(PYv);
+    if (!us.length && vs.length === 1) return NO_GHOSTS;
+    us.push(0);
+    const out = [];
+    for (const a of us) for (const b of vs) if (a || b) out.push([a * C1 - b * S1, a * S1 + b * C1]);
+    return out;
+  }
+  // Bring everything into the world-sized box around the view (huge things excepted).
+  function wrapAll() {
+    updateWrap();
+    if (!WON) return;
+    const sx = W / 2, sy = H / 2;
+    for (const list of [circles, dots, hunters, chasers, spawners]) for (const c of list) {
+      if (c.big || !isFinite(c.cx) || !isFinite(c.cy)) continue;
+      const rx = c.cx - sx, ry = c.cy - sy;
+      mi(rx, ry);
+      if (MX !== rx || MY !== ry) { c.cx = sx + MX; c.cy = sy + MY; dirty = true; }
+    }
+    for (const st of strokes) {
+      if (press && press.stroke === st) continue;           // a line still being drawn stays put
+      const [x0, y0, x1, y1] = strokeBox(st);
+      const rx = (x0 + x1) / 2 - sx, ry = (y0 + y1) / 2 - sy;
+      if (!isFinite(rx) || !isFinite(ry)) continue;
+      mi(rx, ry);
+      const ox = MX - rx, oy = MY - ry;
+      if (!ox && !oy) continue;
+      for (const arr of [st.pts, st.raw]) if (arr) for (let i = 0; i < arr.length; i += 2) { arr[i] += ox; arr[i + 1] += oy; }
+      st.box = null; dirty = true;
+    }
+  }
+
   // ----- Colour forces -----
   // Each pair of coloured circles pulls or pushes by how far apart their hues are:
   // opposite hues (180° apart) attract most, neighbouring hues repel most, and
@@ -311,7 +394,7 @@
     fleeing.length = 0;
     // Hunters copied to flat arrays: hunter objects come in many shapes, which makes
     // reading their fields in the inner loop slow.
-    if (fleeBuf.cap < hunters.length) { const n = Math.max(64, hunters.length * 2); fleeBuf = { cap: n, x: new Float64Array(n), y: new Float64Array(n), r: new Float64Array(n) }; }
+    if (fleeBuf.cap < hunters.length * 4) { const n = Math.max(64, hunters.length * 8); fleeBuf = { cap: n, x: new Float64Array(n), y: new Float64Array(n), r: new Float64Array(n) }; }
     const HX = fleeBuf.x, HY = fleeBuf.y, HR = fleeBuf.r;
     let n = 0, x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, maxR = 0;
     for (const h of hunters) {
@@ -321,6 +404,17 @@
       if (h.r > maxR) maxR = h.r;
     }
     if (!n) return;
+    // The world wraps: hunters near its edge also count from their copies across it.
+    if (WON) {
+      let maxC = 0;
+      for (const c of circles) if (!c.big && c.r > maxC && isFinite(c.r)) maxC = c.r;
+      const m = n, M = 6 * maxC + 10 * maxR;
+      for (let k = 0; k < m; k++) for (const [ox, oy] of ghostOffsets(HX[k], HY[k], M)) {
+        if (n >= fleeBuf.cap) break;
+        const x = HX[k] + ox, y = HY[k] + oy; HX[n] = x; HY[n] = y; HR[n] = HR[k]; n++;
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      }
+    }
     let cs = 20 * maxR;
     while (((x1 - x0) / cs + 1) * ((y1 - y0) / cs + 1) > 4096) cs *= 2;
     const nx = Math.floor((x1 - x0) / cs) + 1, ny = Math.floor((y1 - y0) / cs) + 1, cells = new Array(nx * ny);
@@ -355,6 +449,27 @@
     }
   }
 
+  // Sweep and prune along the world's x axis (screen x when the world doesn't wrap):
+  // fn(a, b) for every pair whose extents overlap that way, including pairs that
+  // only meet across the world's edge. fn returns true to stop checking a.
+  function sweepPairs(list, fn) {
+    const sx = W / 2, sy = H / 2;
+    for (const c of list) c.lx = (WON ? (c.cx - sx) * C1 + (c.cy - sy) * S1 : c.cx) - c.r;
+    list.sort((p, q) => p.lx - q.lx);
+    const m = list.length;
+    for (let i = 0; i < m; i++) {
+      const a = list[i], right = a.lx + 2 * a.r;
+      for (let j = i + 1; j < m; j++) { const b = list[j]; if (b.lx > right) break; if (fn(a, b)) break; }
+    }
+    if (!WON || !m) return;
+    // Across the edge: the right-hand end of the world meets its left-hand start.
+    const first = list[0].lx;
+    for (let i = 0; i < m; i++) {
+      const a = list[i], right = a.lx + 2 * a.r - PXv;
+      if (!(right >= first)) continue;
+      for (let j = 0; j < m; j++) { const b = list[j]; if (b.lx > right) break; if (j === i) continue; if (fn(a, b)) break; }
+    }
+  }
   const bodies = [], coloured = [];   // reused every step, no per-step garbage
   const BUF_KEYS = ['x', 'y', 'r', 'hc', 'hs', 'ax', 'ay'], buf = { cap: 0 };
   // pull = colour forces on. With them off the step still runs while circles are
@@ -385,7 +500,16 @@
       const ax0 = X[i], ay0 = Y[i], ar = R[i], ahc = HC[i], ahs = HS[i];
       let fax = 0, fay = 0;
       for (let j = i + 1; j < n; j++) {
-        const br = R[j], dx = X[j] - ax0, dy = Y[j] - ay0, d = Math.sqrt(dx * dx + dy * dy);
+        const br = R[j];
+        let dx = X[j] - ax0, dy = Y[j] - ay0;
+        if (WON) {                                    // the short way round the world
+          let u = dx * C1 + dy * S1, v = dy * C1 - dx * S1;
+          if (u > HPX || u < -HPX || v > HPY || v < -HPY) {
+            u -= PXv * Math.round(u / PXv); v -= PYv * Math.round(v / PYv);
+            dx = u * C1 - v * S1; dy = u * S1 + v * C1;
+          }
+        }
+        const d = Math.sqrt(dx * dx + dy * dy);
         const ux = d > 0 ? dx / d : 1, uy = d > 0 ? dy / d : 0;
         const pull = -(ahc * HC[j] + ahs * HS[j]);   // +1 opposite hues attract … -1 neighbours repel
         const soft = d > ar + br ? d : ar + br;      // no runaway force once touching
@@ -404,21 +528,16 @@
     }
     // Collisions: push overlapping circles apart and soak up the impact. Sweep and
     // prune: sorted by left edge, each circle only checks those starting before its right edge.
-    for (const c of bodies) c.lx = c.cx - c.r;
-    bodies.sort((p, q) => p.lx - q.lx);
-    const m = bodies.length;
-    for (let i = 0; i < m; i++) {
-      const a = bodies[i], right = a.cx + a.r;
-      for (let j = i + 1; j < m; j++) {
-        const b = bodies[j];
-        if (b.lx > right) break;
-        if (!a.awake && !b.awake) continue;     // two resting circles stay as they are
+    sweepPairs(bodies, (a, b) => {
+        if (!a.awake && !b.awake) return;       // two resting circles stay as they are
         const sol = a.solid * b.solid;
-        if (sol <= 0) continue;                   // fully permeable: they pass through each other
-        const dx = b.cx - a.cx, dy = b.cy - a.cy, min = a.r + b.r;
-        if (Math.abs(dy) >= min) continue;
+        if (sol <= 0) return;                     // fully permeable: they pass through each other
+        let dx = b.cx - a.cx, dy = b.cy - a.cy;
+        const min = a.r + b.r;
+        if (WON) { mi(dx, dy); dx = MX; dy = MY; }
+        if (Math.abs(dy) >= min) return;
         const d = Math.sqrt(dx * dx + dy * dy);
-        if (d >= min || d === 0) continue;
+        if (d >= min || d === 0) return;
         // Mass ~ r², scaled by the bigger circle so tiny circles never underflow.
         const s = a.r > b.r ? a.r : b.r, ma = (a.r / s) ** 2, mb = (b.r / s) ** 2, tot = ma + mb;
         // Partly permeable circles sink into each other and are eased apart: both the
@@ -437,8 +556,7 @@
           b.vx -= jb * ux; b.vy -= jb * uy;
         }
         a.awake = b.awake = true;
-      }
-    }
+    });
     if (pull) collideLines(bodies);
     else {
       awakeList.length = 0;
@@ -454,26 +572,34 @@
   function collideLines(bodies) {
     for (const st of strokes) {
       const p = st.pts, half = st.w / 2, [bx0, by0, bx1, by1] = strokeBox(st), ch = st.chunks;
+      const mx = (bx0 + bx1) / 2, my = (by0 + by1) / 2;
       for (const c of bodies) {
-        const reach = c.r + half;
-        if (c.cx < bx0 - reach || c.cx > bx1 + reach || c.cy < by0 - reach || c.cy > by1 + reach) continue;
-        for (let k = 0; k < ch.length; k += 6) {
-          if (c.cx < ch[k + 2] - reach || c.cx > ch[k + 4] + reach || c.cy < ch[k + 3] - reach || c.cy > ch[k + 5] + reach) continue;
-          for (let i = ch[k]; i + 3 < ch[k + 1]; i += 2) {
-            const ax = p[i], ay = p[i + 1], ex = p[i + 2] - ax, ey = p[i + 3] - ay;
-            const len2 = ex * ex + ey * ey;
-            let t = len2 ? ((c.cx - ax) * ex + (c.cy - ay) * ey) / len2 : 0;
-            t = t < 0 ? 0 : t > 1 ? 1 : t;
-            const qx = ax + ex * t, qy = ay + ey * t;
-            let nx = c.cx - qx, ny = c.cy - qy, d = Math.hypot(nx, ny);
-            if (d >= reach) continue;
-            if (d === 0) { nx = -ey; ny = ex; d = Math.hypot(nx, ny) || 1; }
-            nx /= d; ny /= d;
-            c.cx = qx + nx * reach; c.cy = qy + ny * reach;
-            const vn = (c.vx || 0) * nx + (c.vy || 0) * ny;
-            if (vn < 0) { c.vx -= (1 + RESTITUTION) * vn * nx; c.vy -= (1 + RESTITUTION) * vn * ny; }
-          }
-        }
+        // The world wraps: meet the line from whichever copy of the body is nearest it.
+        let sx = 0, sy = 0;
+        if (WON) { const rx = c.cx - mx, ry = c.cy - my; mi(rx, ry); sx = MX - rx; sy = MY - ry; }
+        if (sx || sy) { c.cx += sx; c.cy += sy; lineHit(st, p, half, bx0, by0, bx1, by1, ch, c); c.cx -= sx; c.cy -= sy; }
+        else lineHit(st, p, half, bx0, by0, bx1, by1, ch, c);
+      }
+    }
+  }
+  function lineHit(st, p, half, bx0, by0, bx1, by1, ch, c) {
+    const reach = c.r + half;
+    if (c.cx < bx0 - reach || c.cx > bx1 + reach || c.cy < by0 - reach || c.cy > by1 + reach) return;
+    for (let k = 0; k < ch.length; k += 6) {
+      if (c.cx < ch[k + 2] - reach || c.cx > ch[k + 4] + reach || c.cy < ch[k + 3] - reach || c.cy > ch[k + 5] + reach) continue;
+      for (let i = ch[k]; i + 3 < ch[k + 1]; i += 2) {
+        const ax = p[i], ay = p[i + 1], ex = p[i + 2] - ax, ey = p[i + 3] - ay;
+        const len2 = ex * ex + ey * ey;
+        let t = len2 ? ((c.cx - ax) * ex + (c.cy - ay) * ey) / len2 : 0;
+        t = t < 0 ? 0 : t > 1 ? 1 : t;
+        const qx = ax + ex * t, qy = ay + ey * t;
+        let nx = c.cx - qx, ny = c.cy - qy, d = Math.hypot(nx, ny);
+        if (d >= reach) continue;
+        if (d === 0) { nx = -ey; ny = ex; d = Math.hypot(nx, ny) || 1; }
+        nx /= d; ny /= d;
+        c.cx = qx + nx * reach; c.cy = qy + ny * reach;
+        const vn = (c.vx || 0) * nx + (c.vy || 0) * ny;
+        if (vn < 0) { c.vx -= (1 + RESTITUTION) * vn * nx; c.vy -= (1 + RESTITUTION) * vn * ny; }
       }
     }
   }
@@ -489,6 +615,48 @@
     if (!forcesOn) for (const c of circles) { c.vx = 0; c.vy = 0; }
     toast(forcesOn ? 'Colour forces on' : 'Colour forces off');
     if (navigator.vibrate) navigator.vibrate([20, 60, 20]);
+  }
+
+  // Black dots run from everything that moves: coloured circles, hunters, chasers
+  // and the player. Each one whose edge is within range pushes the dot away,
+  // strongest close up (¼ + ¾(1 - gap/range)²), capped so the top speed is about a
+  // fleeing circle's; damping then brings it to rest. Lines block them, like
+  // circles. Scaled with zoom, so it looks the same at any zoom.
+  function dotFlee(dt, now) {
+    if (!dots.length) return;
+    const s = world.s, R = DOT_FLEE_RANGE * s, A = DOT_FLEE_SPEED * DOT_DAMPING * s, f = Math.exp(-DOT_DAMPING * dt);
+    if (!(R > 0) || !isFinite(R)) return;
+    const pl = playerLive() ? { cx: W / 2, cy: H / 2, r: player.r } : null;
+    const held = press && press.obj, moved = [];
+    for (const d of dots) {
+      if (d.big || !(d.r > 0) || d === held || !isFinite(d.cx) || !isFinite(d.cy)) continue;
+      let ax = 0, ay = 0, threat = false;
+      const push = (o) => {
+        if (o.big || !(o.r > 0)) return;
+        let dx = d.cx - o.cx, dy = d.cy - o.cy;
+        if (WON) { mi(dx, dy); dx = MX; dy = MY; }
+        const lim = R + d.r + o.r;
+        if (!(Math.abs(dx) < lim && Math.abs(dy) < lim)) return;
+        const dist = Math.sqrt(dx * dx + dy * dy), gap = dist - d.r - o.r;
+        if (!(gap < R)) return;
+        const q = 1 - Math.max(0, gap) / R, w = 0.25 + 0.75 * q * q;   // a floor, so they clear the range and stop rather than creep
+        threat = true;
+        if (dist > 0) { ax += dx / dist * w; ay += dy / dist * w; }
+        else { const t = Math.random() * Math.PI * 2; ax += Math.cos(t) * w; ay += Math.sin(t) * w; }
+      };
+      for (const c of circles) if (!(c.src === d && now - c.born < DOT_OWN_MS)) push(c);
+      for (const h of hunters) push(h);
+      for (const c of chasers) push(c);
+      if (pl) push(pl);
+      const L = Math.hypot(ax, ay);
+      if (L > 1) { ax /= L; ay /= L; }
+      d.vx = ((d.vx || 0) + ax * A * dt) * f; d.vy = ((d.vy || 0) + ay * A * dt) * f;
+      if (!threat && d.vx * d.vx + d.vy * d.vy < (0.05 * d.r) ** 2) { d.vx = 0; d.vy = 0; continue; }   // at rest
+      if (!d.vx && !d.vy) continue;
+      d.cx += d.vx * dt; d.cy += d.vy * dt;
+      moved.push(d);
+    }
+    if (moved.length) { collideLines(moved); dirty = true; }
   }
 
   // Each dot now and then drops a coloured circle its own size, with a small
@@ -508,6 +676,7 @@
         ? { big: true, ox: d.ox + d.nx * (d.r - r), oy: d.oy + d.ny * (d.r - r), nx: d.nx, ny: d.ny, r }   // huge: centred on the dot
         : { cx: d.cx + Math.cos(a) * d.r * 0.05, cy: d.cy + Math.sin(a) * d.r * 0.05, r };
       c.hue = h; c.color = hsl(h); c.vx = Math.cos(a) * v; c.vy = Math.sin(a) * v;
+      c.src = d; c.born = performance.now();       // its dot ignores it for a moment (dots run from circles)
       circles.push(c);
       history.push({ type: 'circle', obj: c });
     }
@@ -591,31 +760,26 @@
     };
     // Ordinary circles: sweep along x so only nearby pairs are looked at.
     eatList.length = 0;
-    for (const c of circles) if (!c.big && c.r > 0 && c !== held) { c.lx = c.cx - c.r; eatList.push(c); }
-    eatList.sort((p, q) => p.lx - q.lx);
-    const n = eatList.length;
-    for (let i = 0; i < n; i++) {
-      const a = eatList[i], right = a.cx + a.r;
-      if (eaten && eaten.has(a)) continue;
-      for (let j = i + 1; j < n; j++) {
-        const b = eatList[j];
-        if (b.lx > right) break;
-        if (eaten && eaten.has(b)) continue;
+    for (const c of circles) if (!c.big && c.r > 0 && c !== held) eatList.push(c);
+    sweepPairs(eatList, (a, b) => {
+        if (eaten && eaten.has(a)) return true;
+        if (eaten && eaten.has(b)) return;
         let big = a, sm = b; if (b.r > a.r) { big = b; sm = a; }
-        if (!(big.r > sm.r * (1 + 1e-9)) || ate.has(big)) continue;   // equal sizes never eat
-        const R = big.r, dx = sm.cx - big.cx, dy = sm.cy - big.cy;
+        if (!(big.r > sm.r * (1 + 1e-9)) || ate.has(big)) return;   // equal sizes never eat
+        const R = big.r;
+        let dx = sm.cx - big.cx, dy = sm.cy - big.cy;
+        if (WON) { mi(dx, dy); dx = MX; dy = MY; }   // the short way round the world
         // A small circle whose centre is outside the big one is never more than half covered.
-        if (Math.abs(dx) >= R || Math.abs(dy) >= R) continue;
+        if (Math.abs(dx) >= R || Math.abs(dy) >= R) return;
         const d2 = dx * dx + dy * dy;
-        if (d2 >= R * R) continue;
+        if (d2 >= R * R) return;
         const d = Math.sqrt(d2);
-        if (d + sm.r > R && lensFrac(R, sm.r, d) <= 0.5) continue;
+        if (d + sm.r > R && lensFrac(R, sm.r, d) <= 0.5) return;
         let ux, uy;
         if (d > 0) { ux = dx / d; uy = dy / d; } else { const t = Math.random() * Math.PI * 2; ux = Math.cos(t); uy = Math.sin(t); }
         eat(big, sm, cloneOf(big, { cx: big.cx + ux * 2 * R, cy: big.cy + uy * 2 * R }));
-        if (sm === a) break;                // a is gone: stop checking it
-      }
-    }
+        if (sm === a) return true;          // a is gone: stop checking it
+    });
     // Huge circles: at that size the edge is a straight line on screen, so a smaller
     // circle is more than half inside when its centre is on the inner side. The
     // clone is the mirror image: a huge circle touching the parent at the point
@@ -650,7 +814,9 @@
   const gapDir = { g: 0, ux: 0, uy: 0 };
   function gapTo(h, c) {
     if (!c.big) {
-      const dx = c.cx - h.cx, dy = c.cy - h.cy, d = Math.sqrt(dx * dx + dy * dy);
+      let dx = c.cx - h.cx, dy = c.cy - h.cy;
+      if (WON) { mi(dx, dy); dx = MX; dy = MY; }   // the short way round the world
+      const d = Math.sqrt(dx * dx + dy * dy);
       gapDir.g = d - c.r - h.r; gapDir.ux = d > 0 ? dx / d : 0; gapDir.uy = d > 0 ? dy / d : 0;
     } else {
       gapDir.g = -((h.cx - c.ox) * c.nx + (h.cy - c.oy) * c.ny) - h.r; gapDir.ux = c.nx; gapDir.uy = c.ny;
@@ -688,15 +854,18 @@
   // The K nearest circles to hunter h that aren't in `skip`, nearest first.
   function kNearest(h, list, skip, K) {
     const gs = [], cs = [];
-    let worst = Infinity;
+    let worst = Infinity, dup = false;
     const consider = (c) => {
       if (skip && skip.has(c)) return;
       if (!c.big && gs.length === K) {                        // cheap reject before the square root
         const lim = worst + c.r + h.r;
-        if (Math.abs(c.cx - h.cx) > lim || Math.abs(c.cy - h.cy) > lim) return;
+        let dx = c.cx - h.cx, dy = c.cy - h.cy;
+        if (WON) { mi(dx, dy); dx = MX; dy = MY; }
+        if (Math.abs(dx) > lim || Math.abs(dy) > lim) return;
       }
       const g = gapTo(h, c);
       if (gs.length === K && g >= worst) return;
+      if (dup && cs.includes(c)) return;                     // already found from another copy
       let i = gs.length < K ? gs.length : K - 1;
       while (i > 0 && gs[i - 1] > g) { gs[i] = gs[i - 1]; cs[i] = cs[i - 1]; i--; }
       gs[i] = g; cs[i] = c;
@@ -705,13 +874,23 @@
     const G = grid;
     if (!G || list !== G.list) { for (const c of list) consider(c); return { gs, cs }; }
     for (const c of G.always) consider(c);
-    // Rings of cells around the hunter, nearest first, until no closer circle is possible.
-    const hx = Math.floor((h.cx - G.x0) / G.cs), hy = Math.floor((h.cy - G.y0) / G.cs);
+    rings(h, h.cx, h.cy, G, consider, gs, K, () => worst);
+    // The world wraps: also look from the hunter's copies across the world's edge
+    // (only those that could still find something nearer).
+    // (Fewer than K found means the whole grid was already searched.)
+    dup = true;
+    if (gs.length === K) for (const [ox, oy] of ghostOffsets(h.cx, h.cy, worst + h.r + 2 * G.cs))
+      rings(h, h.cx + ox, h.cy + oy, G, consider, gs, K, () => worst);
+    return { gs, cs };
+  }
+  // Rings of cells around (qx, qy), nearest first, until no closer circle is possible.
+  function rings(h, qx, qy, G, consider, gs, K, getWorst) {
+    const hx = Math.floor((qx - G.x0) / G.cs), hy = Math.floor((qy - G.y0) / G.cs);
     const kmin = Math.max(0, -hx, hx - (G.nx - 1), -hy, hy - (G.ny - 1));
     const kmax = Math.max(hx, G.nx - 1 - hx, hy, G.ny - 1 - hy);
     const cell = (x, y) => { const a = G.cells[x + G.nx * y]; if (a) for (const c of a) consider(c); };
     for (let k = kmin; k <= kmax; k++) {
-      if (gs.length === K && (k - 1) * G.cs - G.cs - h.r > worst) break;   // everything further is too far
+      if (gs.length === K && (k - 1) * G.cs - G.cs - h.r > getWorst()) break;   // everything further is too far
       const xa = Math.max(0, hx - k), xb = Math.min(G.nx - 1, hx + k);
       if (hy - k >= 0 && hy - k < G.ny) for (let x = xa; x <= xb; x++) cell(x, hy - k);
       if (k > 0 && hy + k >= 0 && hy + k < G.ny) for (let x = xa; x <= xb; x++) cell(x, hy + k);
@@ -719,7 +898,6 @@
       if (k > 0 && hx - k >= 0 && hx - k < G.nx) for (let y = ya; y <= yb; y++) cell(hx - k, y);
       if (k > 0 && hx + k >= 0 && hx + k < G.nx) for (let y = ya; y <= yb; y++) cell(hx + k, y);
     }
-    return { gs, cs };
   }
   // Share out targets: repeatedly take the closest hunter–circle pair overall and
   // pair them off. Each hunter only offers its K nearest unclaimed circles; if a
@@ -763,7 +941,8 @@
     let fx = 0, fy = 0, w = 0;
     for (const c of chasers) {
       if (c.big || !(c.r > 0)) continue;
-      const dx = h.cx - c.cx, dy = h.cy - c.cy;
+      let dx = h.cx - c.cx, dy = h.cy - c.cy;
+      if (WON) { mi(dx, dy); dx = MX; dy = MY; }   // the short way round the world
       if (!(Math.abs(dx) < range && Math.abs(dy) < range)) continue;
       const d = Math.sqrt(dx * dx + dy * dy);
       if (!(d < range)) continue;
@@ -975,9 +1154,10 @@
       octx.beginPath(); octx.arc(p.x, p.y, p.r * (1 + 0.6 * t), 0, Math.PI * 2); octx.stroke();
     }
     octx.globalAlpha = 1;
-    for (const sp of spawners) if (sp.r > 0) drawSpawner(sp, sp.kind === 'hunter' ? RED : BLUE);   // under what they release
-    for (const h of hunters) if (h.r > 0) drawHunter(h, now);
-    for (const c of chasers) if (c.r > 0) drawHunter(c, now, BLUE);
+    for (const sp of spawners) if (sp.r > 0) withCopies(sp, 3, (c) => drawSpawner(c, sp.kind === 'hunter' ? RED : BLUE));   // under what they release
+    for (const h of hunters) if (h.r > 0) withCopies(h, 2, (c) => drawHunter(c, now));
+    for (const c of chasers) if (c.r > 0) withCopies(c, 2, (o) => drawHunter(o, now, BLUE));
+    if (mode === 'edit') drawSeams();
     if (mode === 'edit') {   // the corner docks: hunter, hunter spawner, chaser, chaser spawner
       drawHunter({ cx: redX, cy: redY, r: HUNTER_R }, now);
       drawSpawner({ cx: redX, cy: redY - DOCK_GAP, r: SPAWNER_R }, RED);
@@ -993,6 +1173,26 @@
     }
   }
   const BLUE = '#2a7bff', RED = '#ff2a2a';
+  // Edit: faint dashed lines where the world's edges were first laid out. Only a
+  // guide to its size: nothing happens at them, the world just carries on round.
+  function drawSeams() {
+    if (!WON) return;
+    const diag = Math.hypot(W, H), sx = W / 2, sy = H / 2;
+    const cu = (sx - world.ox) * C1 + (sy - world.oy) * S1, cv = (sy - world.oy) * C1 - (sx - world.ox) * S1;   // view centre in world axes
+    octx.save();
+    octx.strokeStyle = 'rgba(255,255,255,.55)'; octx.lineWidth = 1.5; octx.setLineDash([10, 8]);
+    octx.beginPath();
+    for (let i = Math.ceil((cu - diag) / PXv); i <= Math.floor((cu + diag) / PXv); i++) {   // edges across the world's x axis
+      const du = i * PXv - cu, x = sx + du * C1, y = sy + du * S1;
+      octx.moveTo(x + S1 * diag, y - C1 * diag); octx.lineTo(x - S1 * diag, y + C1 * diag);
+    }
+    for (let j = Math.ceil((cv - diag) / PYv); j <= Math.floor((cv + diag) / PYv); j++) {
+      const dv = j * PYv - cv, x = sx - dv * S1, y = sy + dv * C1;
+      octx.moveTo(x - C1 * diag, y - S1 * diag); octx.lineTo(x + C1 * diag, y + S1 * diag);
+    }
+    octx.stroke();
+    octx.restore();
+  }
 
   // ----- Player -----
   // Tilt: the readings in the first 0.3 s after load (and after each restart) are
@@ -1091,7 +1291,8 @@
       if (c === held || c.big || !(c.r > 0)) continue;
       const P = player.r;
       if (!(P > c.r * (1 + 1e-9))) continue;
-      const dx = c.cx - px, dy = c.cy - py;
+      let dx = c.cx - px, dy = c.cy - py;
+      if (WON) { mi(dx, dy); dx = MX; dy = MY; }
       if (Math.abs(dx) >= P || Math.abs(dy) >= P) continue;
       const d2 = dx * dx + dy * dy;
       if (d2 >= P * P) continue;
@@ -1122,7 +1323,9 @@
         if (!(t > 0)) continue;
         clone = cloneOf(c, { big: true, ox: px - t * c.nx, oy: py - t * c.ny, nx: -c.nx, ny: -c.ny });
       } else {
-        const R = c.r, dx = px - c.cx, dy = py - c.cy;
+        const R = c.r;
+        let dx = px - c.cx, dy = py - c.cy;
+        if (WON) { mi(dx, dy); dx = MX; dy = MY; }
         if (Math.abs(dx) >= R || Math.abs(dy) >= R) continue;
         const d2 = dx * dx + dy * dy;
         if (d2 >= R * R) continue;
@@ -1130,7 +1333,7 @@
         if (d + P > R && lensFrac(R, P, d) <= 0.5) continue;
         let ux, uy;
         if (d > 0) { ux = dx / d; uy = dy / d; } else { const a = Math.random() * Math.PI * 2; ux = Math.cos(a); uy = Math.sin(a); }
-        clone = cloneOf(c, { cx: c.cx + ux * 2 * R, cy: c.cy + uy * 2 * R });
+        clone = cloneOf(c, { cx: px - dx + ux * 2 * R, cy: py - dy + uy * 2 * R });
       }
       killer = c; break;
     }
@@ -1157,7 +1360,8 @@
     for (let i = 0; i < hunters.length; i++) {
       const h = hunters[i];
       if (h.big || !(h.r > 0)) continue;
-      if (!(Math.hypot(h.cx - px, h.cy - py) <= (player.r + h.r) * (1 + 1e-9))) continue;
+      mi(h.cx - px, h.cy - py);
+      if (!(Math.hypot(MX, MY) <= (player.r + h.r) * (1 + 1e-9))) continue;
       hunters.splice(i, 1);
       const k = history.findIndex(it => it.obj === h); if (k >= 0) history.splice(k, 1);
       pops.push({ x: h.cx, y: h.cy, r: h.r * 1.5, color: '#ff2a2a', t0: now });
@@ -1215,6 +1419,7 @@
     const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
     const tFrame = performance.now();   // the physics budget includes working out who flees
     const live = mode === 'play' || simInEdit;   // Edit freezes the world
+    wrapAll();                                   // everything into the world-sized box around the view
     if (live && dt > 0) circleFlee(); else if (!live) fleeing.length = 0;
     let coasting = forcesOn || fleeing.length > 0;
     if (!coasting) for (const c of circles) if (c.vx || c.vy) { coasting = true; break; }
@@ -1237,6 +1442,7 @@
     player.cx = W / 2; player.cy = H / 2;
     if (live) {
       if (dt > 0) movePlayer(dt, now);
+      if (dt > 0) dotFlee(dt, now);
       eatStep();
       playerStep(now);
       if (dt > 0) { huntStep(dt, now); chaseStep(dt, now); }
@@ -1251,42 +1457,59 @@
       for (const c of circles) {
         if (c.r <= 0) continue;
         ctx.fillStyle = c.color;
-        fillDisc(c);
+        withCopies(c, 0, fillDisc);
       }
       ctx.strokeStyle = LINE_COLOR; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
       for (const st of strokes) {
-        const p = st.pts, [x0, y0, x1, y1] = strokeBox(st), m = st.w;
-        if (x1 < -m || y1 < -m || x0 > W + m || y0 > H + m || p.length < 2) continue;
-        ctx.lineWidth = st.w;
-        ctx.beginPath();
-        if (p.length === 2) { ctx.moveTo(p[0], p[1]); ctx.lineTo(p[0] + 0.01, p[1]); }
-        else {
-          // Skip segments far off screen so huge zooms stay safe to draw.
-          let pen = false;
-          for (let i = 0; i + 3 < p.length; i += 2) {
-            const ax = p[i], ay = p[i + 1], bx = p[i + 2], by = p[i + 3];
-            const off = (ax < -m && bx < -m) || (ay < -m && by < -m) || (ax > W + m && bx > W + m) || (ay > H + m && by > H + m);
-            if (off) { pen = false; continue; }
-            const far = Math.max(Math.abs(ax), Math.abs(ay), Math.abs(bx), Math.abs(by)) > 1e7;
-            if (far) {
-              // Clip a very long segment to a box around the screen before drawing it.
-              const c = clipSeg(ax, ay, bx, by, -m - 10, -m - 10, W + m + 10, H + m + 10);
-              if (!c) { pen = false; continue; }
-              ctx.moveTo(c[0], c[1]); ctx.lineTo(c[2], c[3]); pen = false; continue;
-            }
-            if (!pen) { ctx.moveTo(ax, ay); pen = true; }
-            ctx.lineTo(bx, by);
-          }
-        }
-        ctx.stroke();
+        const [x0, y0, x1, y1] = strokeBox(st);
+        drawStroke(st, 0, 0);
+        // Near the world's edge: its copy on the other side too.
+        for (const [ox, oy] of ghostOffsets((x0 + x1) / 2, (y0 + y1) / 2, Math.hypot(x1 - x0, y1 - y0) / 2 + st.w)) drawStroke(st, ox, oy);
       }
-      for (const d of dots) if (d.r > 0) drawDot(d);
+      for (const d of dots) if (d.r > 0) withCopies(d, 2, drawDot);
       drawPlayer(now);
       if (mode === 'edit') drawDot({ cx: dockX, cy: dockY, r: DOT_R });   // the corner dot (Edit only)
       if (dotDrag && dotDrag.kind === 'dot') drawDot({ cx: dotDrag.x, cy: dotDrag.y, r: DOT_R });  // a dot being dragged out
     }
     drawOverlay(now);
     requestAnimationFrame(draw);
+  }
+  // Draw something here and, if it's near the world's edge, its copies on the other side.
+  function withCopies(c, pad, fn) {
+    fn(c);
+    if (!WON || c.big || !(c.r < HPX)) return;
+    const g = ghostOffsets(c.cx, c.cy, c.r + pad);
+    if (!g.length) return;
+    const x = c.cx, y = c.cy;
+    for (const [ox, oy] of g) { c.cx = x + ox; c.cy = y + oy; fn(c); }
+    c.cx = x; c.cy = y;
+  }
+  // A line, shifted by (ox, oy) (its copy across the world's edge).
+  function drawStroke(st, ox, oy) {
+    const p = st.pts, [bx0, by0, bx1, by1] = strokeBox(st), m = st.w;
+    if (bx1 + ox < -m || by1 + oy < -m || bx0 + ox > W + m || by0 + oy > H + m || p.length < 2) return;
+    ctx.lineWidth = st.w;
+    ctx.beginPath();
+    if (p.length === 2) { ctx.moveTo(p[0] + ox, p[1] + oy); ctx.lineTo(p[0] + ox + 0.01, p[1] + oy); }
+    else {
+      // Skip segments far off screen so huge zooms stay safe to draw.
+      let pen = false;
+      for (let i = 0; i + 3 < p.length; i += 2) {
+        const ax = p[i] + ox, ay = p[i + 1] + oy, bx = p[i + 2] + ox, by = p[i + 3] + oy;
+        const off = (ax < -m && bx < -m) || (ay < -m && by < -m) || (ax > W + m && bx > W + m) || (ay > H + m && by > H + m);
+        if (off) { pen = false; continue; }
+        const far = Math.max(Math.abs(ax), Math.abs(ay), Math.abs(bx), Math.abs(by)) > 1e7;
+        if (far) {
+          // Clip a very long segment to a box around the screen before drawing it.
+          const c = clipSeg(ax, ay, bx, by, -m - 10, -m - 10, W + m + 10, H + m + 10);
+          if (!c) { pen = false; continue; }
+          ctx.moveTo(c[0], c[1]); ctx.lineTo(c[2], c[3]); pen = false; continue;
+        }
+        if (!pen) { ctx.moveTo(ax, ay); pen = true; }
+        ctx.lineTo(bx, by);
+      }
+    }
+    ctx.stroke();
   }
   // Liang–Barsky: the part of segment (ax,ay)-(bx,by) inside a rectangle, or null.
   function clipSeg(ax, ay, bx, by, x0, y0, x1, y1) {
@@ -1301,6 +1524,7 @@
   }
   addEventListener('resize', resize);
   resize();
+  initWorld();
   requestAnimationFrame(draw);
 
   // ----- Corner dots: drag from the black one to place a dot, from the red one to place a hunter -----
@@ -1359,7 +1583,7 @@
   // Small things can be grabbed up to GRAB_R px from their centre.
   function objectAt(x, y) {
     const hit = (c) => c.r > 0 && (c.big ? (x - c.ox) * c.nx + (y - c.oy) * c.ny >= 0
-                                         : Math.hypot(x - c.cx, y - c.cy) <= Math.max(c.r, GRAB_R));
+                                         : (mi(x - c.cx, y - c.cy), Math.hypot(MX, MY) <= Math.max(c.r, GRAB_R)));
     for (const list of [chasers, hunters, spawners, dots, circles])   // drawn on top first
       for (let i = list.length - 1; i >= 0; i--) if (hit(list[i])) return list[i];
     return null;
@@ -1419,7 +1643,7 @@
       const c = circles[i];
       if (c.r <= 0) continue;
       const inside = c.big ? (x - c.ox) * c.nx + (y - c.oy) * c.ny >= 0
-                           : Math.hypot(x - c.cx, y - c.cy) <= c.r;
+                           : (mi(x - c.cx, y - c.cy), Math.hypot(MX, MY) <= c.r);
       if (inside) return c;
     }
     return null;
@@ -1464,6 +1688,7 @@
     if (dotDrag) dotDrag = null;
     hue = Math.floor(Math.random() * 360); paint();
     restart();                       // player in the middle, score 0, immune for a moment, tilt re-calibrates
+    recentreWorld();                 // same world size; its guide edges laid out around the view again
     dirty = true;
     toast('Game reset');
     if (navigator.vibrate) navigator.vibrate([30, 50, 30, 50, 30]);
@@ -1736,7 +1961,11 @@
     emitStats, resetGame, spawnWait, SPAWNER_MEAN_S, laptop, get cursor() { return cursor; }, get mouseHeld() { return mouseHeld; },
     get steering() { return steering; }, get hintOn() { return hintOn; },
     playerObj: player, setTilt: onTilt, restart,
-    get playerOn() { return playerOn; }, set playerOn(v) { playerWanted = !!v; syncPlayer(); } };
+    get playerOn() { return playerOn; }, set playerOn(v) { playerWanted = !!v; syncPlayer(); },
+    // the wrapping world: size in load px, scale, angle, guide origin; period on screen now
+    get world() { updateWrap(); return { WX: world.WX, WY: world.WY, s: world.s, a: world.a, ox: world.ox, oy: world.oy, PX: PXv, PY: PYv, wrapping: WON, minScale: minScale() }; },
+    get worldOn() { return worldOn; }, set worldOn(v) { worldOn = !!v; updateWrap(); },   // test hook: off = the old unbounded plane
+    wrapNow: wrapAll, DOT_FLEE_RANGE, DOT_FLEE_SPEED };
 </script>
 <script src="hud.js"></script>
 </body>
