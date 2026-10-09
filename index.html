@@ -743,9 +743,10 @@
       emitStats.circle++;
       const h = Math.floor(Math.random() * 360);   // any hue, the background's included
       const a = Math.random() * Math.PI * 2, v = d.r * (1.5 + Math.random() * 2);
-      // Mixed sizes (some bigger than a new player), and bigger on average the older the
-      // dot: the mean doubles after a minute of running, triples after two, and so on.
-      const r = d.r * (EMIT_MIN + Math.random() * (EMIT_MAX - EMIT_MIN)) * (1 + (d.age || 0) / DOT_AGE_S);
+      // Mixed sizes (some bigger than a new player); the older the dot, the bigger they can be.
+      // v41: uniform in radius between a fixed minimum and a maximum that grows with age (no cap),
+      // so even an old dot is as likely to release a small circle as a large one.
+      const r = d.r * (EMIT_MIN + Math.random() * (EMIT_MAX * (1 + (d.age || 0) / DOT_AGE_S) - EMIT_MIN));
       const c = d.big
         ? { big: true, ox: d.ox + d.nx * (d.r - r), oy: d.oy + d.ny * (d.r - r), nx: d.nx, ny: d.ny, r }   // huge: centred on the dot
         : { cx: d.cx + Math.cos(a) * d.r * 0.05, cy: d.cy + Math.sin(a) * d.r * 0.05, r };
