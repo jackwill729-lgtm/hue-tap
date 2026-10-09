@@ -30,11 +30,8 @@
   #penBtn{position:absolute;right:calc(100% + 8px);top:50%;transform:translateY(-50%);width:34px;height:34px;border-radius:17px;background:rgba(0,0,0,.35);font-size:17px!important;padding:0}
   #penBtn.on{background:#fff;color:#222!important;box-shadow:0 0 0 2px rgba(0,0,0,.25)}
   #diceBtn{position:absolute;left:50%;top:calc(100% + 8px);transform:translateX(-50%);width:32px;height:32px;border-radius:16px;background:rgba(0,0,0,.35);font-size:18px!important;padding:0;line-height:32px!important}
-  #creBtn{position:absolute;left:calc(50% + 24px);top:calc(100% + 8px);width:32px;height:32px;border-radius:16px;background:rgba(0,0,0,.35);padding:0;display:flex;align-items:center;justify-content:center;gap:2px}
-  #creBtn i{display:block;width:7px;height:7px;border-radius:50%;box-shadow:0 0 0 1px rgba(255,255,255,.85)}
-  #creBtn i.k{background:#000}#creBtn i.r{background:#ff2a2a}#creBtn i.b{background:#2a7bff}
-  #creBtn.off i{opacity:.35}
-  #creBtn.off::after{content:'';position:absolute;left:5px;right:5px;top:50%;height:2px;margin-top:-1px;background:#fff;border-radius:1px;transform:rotate(-45deg);box-shadow:0 0 0 1px rgba(0,0,0,.35)}
+  #runBtn{position:absolute;left:calc(50% + 24px);top:calc(100% + 8px);width:32px;height:32px;border-radius:16px;background:rgba(0,0,0,.35);padding:0;font-size:13px!important;line-height:32px!important;letter-spacing:-2px}
+  #runBtn.on{background:#fff;color:#222!important;box-shadow:0 0 0 2px rgba(0,0,0,.25)}
   #fps{position:fixed;left:50%;bottom:calc(6px + env(safe-area-inset-bottom));transform:translateX(-50%);font:500 11px/1 -apple-system,system-ui,sans-serif;
     color:rgba(255,255,255,.7);text-shadow:0 0 3px rgba(0,0,0,.45);pointer-events:none;z-index:2;white-space:nowrap}
   #hint{position:fixed;left:50%;bottom:calc(68px + env(safe-area-inset-bottom));transform:translateX(-50%);max-width:calc(100% - 140px);
@@ -47,7 +44,7 @@
 <canvas id="o"></canvas>
 <div id="toast"></div>
 <div id="score"></div>
-<div id="bar"><button id="penBtn" title="Pencil: drag draws lines (L)" aria-pressed="false">✎</button><button id="modeBtn" title="Switch Edit / Play (Tab)"><span id="mEdit" class="on">Edit</span><span id="mPlay">Play</span></button><button id="diceBtn" title="Scatter random spawners over the world (X)" aria-label="Random spawners">🎲</button><button id="creBtn" title="Black dots, hunters and chasers on / off (T)" aria-label="Black dots, hunters and chasers" aria-pressed="true"><i class="k"></i><i class="r"></i><i class="b"></i></button></div>
+<div id="bar"><button id="penBtn" title="Pencil: drag draws lines (L)" aria-pressed="false">✎</button><button id="modeBtn" title="Switch Edit / Play (Tab)"><span id="mEdit" class="on">Edit</span><span id="mPlay">Play</span></button><button id="diceBtn" title="Scatter random spawners over the world (X)" aria-label="Random spawners">🎲</button><button id="runBtn" title="Run / pause the world while editing (T)" aria-label="Run" aria-pressed="false">▶</button></div>
 <div id="fps"></div>
 <div id="hint"></div>
 <div id="over"><b>Game over</b><span id="overScore"></span><small>Tap to play again</small></div>
@@ -139,16 +136,6 @@
   function addHunter(x, y, r = HUNTER_R) { const h = { cx: x, cy: y, r, popCount: 0 }; hunters.push(h); history.push({ type: 'hunter', obj: h }); return h; }
   function addChaser(x, y, r = CHASER_R) { const c = { cx: x, cy: y, r }; chasers.push(c); history.push({ type: 'chaser', obj: c }); return c; }
   const spawnWait = () => -Math.log(1 - Math.random()) * SPAWNER_MEAN_S;
-  // The Edit toggle: black dots, hunters, chasers and both spawners together. Off, they
-  // stay where they are (dimmed in Edit, hidden in Play) but take no part in anything:
-  // while the world steps, they're lifted out of their lists and put back after.
-  let creaturesOn = true;
-  const CREATURE_LISTS = () => [dots, hunters, chasers, spawners];
-  function parked(fn) {
-    if (creaturesOn) return fn();
-    const lists = CREATURE_LISTS(), saved = lists.map((l) => l.splice(0));
-    try { return fn(); } finally { lists.forEach((l, i) => { for (const o of saved[i]) l.push(o); }); }
-  }
   // Red hunters dragged out of the other corner: same small/big forms as circles.
   // Each one chases the nearest circle and pops it.
   const hunters = [];  // {cx, cy, r} or the big form
@@ -164,7 +151,8 @@
   // Two modes. Edit: a level editor with the world frozen (navigate, place and move
   // things). Play: the world runs, the player dot appears and the game rules apply.
   let mode = 'edit';
-  let simInEdit = false;     // test hook: run the world while editing (the old all-in-one sandbox)
+  let simInEdit = false;     // test hook: run the world while editing (the old all-in-one sandbox, with the player)
+  let editRun = false;       // Edit's Run / Pause: the world runs as in Play, but with no player
   let pencil = false;        // Edit: a one-finger drag on empty space draws a line instead of panning
   let playerWanted = true;   // tests can switch the player off
   let playerOn = false;      // the player is in the game right now (Play, or the test sandbox)
@@ -1141,11 +1129,9 @@
   }
 
   // A red (or blue) dot with a thin light ring, pulsing about twice a second.
-  const OFF_ALPHA = 0.25;   // creatures toggled off, as drawn in Edit
-  let dimA = 1;
   function drawHunter(c, now, color = '#ff2a2a') {
     const a = 0.3 + 0.7 * (0.5 + 0.5 * Math.cos(now / 1000 * Math.PI * 4));
-    octx.globalAlpha = a * dimA;
+    octx.globalAlpha = a;
     octx.fillStyle = color;
     if (fillDisc(c, octx) && c.r < 1e5) {
       octx.lineWidth = Math.min(2, c.r * 0.25); octx.strokeStyle = 'rgba(255,255,255,.9)';
@@ -1156,7 +1142,6 @@
   // A spawner: its corner's colour, steady (never flashing), with a thick white
   // ring and a dark centre, so it doesn't look like the hunters it releases.
   function drawSpawner(c, color) {
-    octx.globalAlpha = dimA;
     octx.fillStyle = color;
     if (fillDisc(c, octx) && c.r < 1e5) {
       octx.lineWidth = Math.min(3, c.r * 0.3); octx.strokeStyle = '#FFFFFF';
@@ -1164,7 +1149,6 @@
       octx.fillStyle = 'rgba(0,0,0,.6)';
       octx.beginPath(); octx.arc(c.cx, c.cy, c.r * 0.38, 0, Math.PI * 2); octx.fill();
     }
-    octx.globalAlpha = 1;
   }
   function drawOverlay(now) {
     octx.clearRect(0, 0, W, H);
@@ -1189,13 +1173,9 @@
       octx.beginPath(); octx.arc(p.x, p.y, p.r * (1 + 0.6 * t), 0, Math.PI * 2); octx.stroke();
     }
     octx.globalAlpha = 1;
-    if (creaturesOn || mode === 'edit') {       // off: dimmed in Edit, hidden in Play
-      dimA = creaturesOn ? 1 : OFF_ALPHA;
-      for (const sp of spawners) if (sp.r > 0) withCopies(sp, 3, (c) => drawSpawner(c, sp.kind === 'hunter' ? RED : BLUE));   // under what they release
-      for (const h of hunters) if (h.r > 0) withCopies(h, 2, (c) => drawHunter(c, now));
-      for (const c of chasers) if (c.r > 0) withCopies(c, 2, (o) => drawHunter(o, now, BLUE));
-      dimA = 1;
-    }
+    for (const sp of spawners) if (sp.r > 0) withCopies(sp, 3, (c) => drawSpawner(c, sp.kind === 'hunter' ? RED : BLUE));   // under what they release
+    for (const h of hunters) if (h.r > 0) withCopies(h, 2, (c) => drawHunter(c, now));
+    for (const c of chasers) if (c.r > 0) withCopies(c, 2, (o) => drawHunter(o, now, BLUE));
     if (mode === 'edit') drawSeams();
     if (mode === 'edit') {   // the corner docks: hunter, hunter spawner, chaser, chaser spawner
       drawHunter({ cx: redX, cy: redY, r: HUNTER_R }, now);
@@ -1501,42 +1481,40 @@
     now = now || performance.now();
     const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
     const tFrame = performance.now();   // the physics budget includes working out who flees
-    const live = mode === 'play' || simInEdit;   // Edit freezes the world
+    const live = mode === 'play' || simInEdit || editRun;   // Edit freezes the world unless it's running
+    const forcing = forcesOn || (mode === 'edit' && editRun);   // running in Edit: colour forces on, as in Play
     wrapAll();                                   // everything into the world-sized box around the view
-    let coasting = false;
-    parked(() => {                               // creatures toggled off sit this out
-      if (live && dt > 0) circleFlee(); else if (!live) fleeing.length = 0;
-      coasting = forcesOn || fleeing.length > 0;
-      if (!coasting) for (const c of circles) if (c.vx || c.vy) { coasting = true; break; }
-      if (live && dt > 0) for (const d of dots) d.age = (d.age || 0) + dt;   // dots age only while the world runs
-      if (live && coasting && dt > 0) {
-        if (forcesOn) emit(dt);
-        // Enough sub-steps that no circle moves more than a third of its radius
-        // per step, so circles can't tunnel through a line.
-        let worst = 0;
-        for (const c of circles) if (!c.big && c.r > 0 && c.vx) worst = Math.max(worst, Math.hypot(c.vx, c.vy) * dt / c.r);
-        const steps = Math.min(60, Math.max(3, Math.ceil(worst * 3)));
-        // With very many circles, stop when the frame's physics budget is spent:
-        // the simulation runs slower instead of the screen freezing.
-        for (let i = 0; i < steps; i++) {
-          stepForces(dt / steps, forcesOn);
-          if (performance.now() - tFrame > FRAME_BUDGET_MS) break;
-        }
+    if (live && dt > 0) circleFlee(); else if (!live) fleeing.length = 0;
+    let coasting = forcing || fleeing.length > 0;
+    if (!coasting) for (const c of circles) if (c.vx || c.vy) { coasting = true; break; }
+    if (live && dt > 0) for (const d of dots) d.age = (d.age || 0) + dt;   // dots age only while the world runs
+    if (live && coasting && dt > 0) {
+      if (forcing) emit(dt);
+      // Enough sub-steps that no circle moves more than a third of its radius
+      // per step, so circles can't tunnel through a line.
+      let worst = 0;
+      for (const c of circles) if (!c.big && c.r > 0 && c.vx) worst = Math.max(worst, Math.hypot(c.vx, c.vy) * dt / c.r);
+      const steps = Math.min(60, Math.max(3, Math.ceil(worst * 3)));
+      // With very many circles, stop when the frame's physics budget is spent:
+      // the simulation runs slower instead of the screen freezing.
+      for (let i = 0; i < steps; i++) {
+        stepForces(dt / steps, forcing);
+        if (performance.now() - tFrame > FRAME_BUDGET_MS) break;
       }
-    });
-    if (live && coasting && dt > 0) { normalise(); dirty = true; }   // everything, parked or not
+      normalise();
+      dirty = true;
+    }
     player.cx = W / 2; player.cy = H / 2;
     if (live) {
       if (dt > 0) movePlayer(dt, now);
-      if (dt > 0) sizeZoom(dt, now);             // zooms everything, parked or not
-      parked(() => {
-        if (dt > 0) dotFlee(dt, now);
-        eatStep();
-        playerStep(now);
-        if (dt > 0) { huntStep(dt, now); chaseStep(dt, now); }
-        catchStep(now);
-      });
+      if (dt > 0) sizeZoom(dt, now);
+      if (dt > 0) dotFlee(dt, now);
+      eatStep();
+      playerStep(now);
+      if (dt > 0) { huntStep(dt, now); chaseStep(dt, now); }
+      catchStep(now);
     }
+    holdDragged();                               // what's being dragged stays under the finger
     if (playerOn && (invulnerable(now) || huntSafe(now))) dirty = true;   // blinking
     showScore();
     if (dirty) {
@@ -1555,11 +1533,7 @@
         // Near the world's edge: its copy on the other side too.
         for (const [ox, oy] of ghostOffsets((x0 + x1) / 2, (y0 + y1) / 2, Math.hypot(x1 - x0, y1 - y0) / 2 + st.w)) drawStroke(st, ox, oy);
       }
-      if (creaturesOn || mode === 'edit') {     // off: dimmed in Edit, hidden in Play
-        ctx.globalAlpha = creaturesOn ? 1 : OFF_ALPHA;
-        for (const d of dots) if (d.r > 0) withCopies(d, 2, drawDot);
-        ctx.globalAlpha = 1;
-      }
+      for (const d of dots) if (d.r > 0) withCopies(d, 2, drawDot);
       drawPlayer(now);
       if (mode === 'edit') drawDot({ cx: dockX, cy: dockY, r: DOT_R });   // the corner dot (Edit only)
       if (dotDrag && dotDrag.kind === 'dot') drawDot({ cx: dotDrag.x, cy: dotDrag.y, r: DOT_R });  // a dot being dragged out
@@ -1681,6 +1655,14 @@
       for (let i = list.length - 1; i >= 0; i--) if (hit(list[i])) return list[i];
     return null;
   }
+  // While the world runs, a dragged thing is held where the finger puts it.
+  function holdDragged() {
+    if (!press || !press.moving || press.obj.big || !(mode === 'play' || simInEdit || editRun)) return;
+    const o = press.obj;
+    o.cx = press.x + press.gx; o.cy = press.y + press.gy;
+    if (o.vx) o.vx = 0; if (o.vy) o.vy = 0;
+    dirty = true;
+  }
   function moveObj(o, dx, dy) {
     if (o.big) { o.ox += dx; o.oy += dy; } else { o.cx += dx; o.cy += dy; }
     dirty = true;
@@ -1699,12 +1681,13 @@
     if (!press.stroke && !press.moving && !press.pan) {
       if (Math.hypot(x - press.x0, y - press.y0) < DRAG_PX) return;
       clearTimeout(press.timer);
-      if (press.obj) press.moving = true;
+      if (press.obj) { press.moving = true; press.gx = press.obj.cx - press.lx; press.gy = press.obj.cy - press.ly; }   // grab offset
       else if (!pencil) press.pan = true;
     }
     if (press.moving || press.pan) {
       const dx = x - press.lx, dy = y - press.ly; press.lx = x; press.ly = y;
-      if (press.moving) moveObj(press.obj, dx, dy); else transformAll(1, 0, 0, dx, dy);
+      if (press.moving && !press.obj.big) { press.obj.cx = x + press.gx; press.obj.cy = y + press.gy; dirty = true; }   // absolute: the world may be running
+      else if (press.moving) moveObj(press.obj, dx, dy); else transformAll(1, 0, 0, dx, dy);
       return;
     }
     if (!press.stroke) {
@@ -1821,7 +1804,7 @@
     forcesOn = mode === 'play';
     cancelTwoHold(); lastTwoTap = null; restartTap = null;
     if (dotDrag) dotDrag = null;
-    setCreatures(true);              // everything on again
+    setRun(false);                   // Edit's world paused again
     hue = Math.floor(Math.random() * 360); paint();
     restart();                       // player in the middle, 100%, immune for a moment, tilt re-calibrates
     recentreWorld();                 // same world size; its guide edges laid out around the view again
@@ -2032,7 +2015,7 @@
     else if ((e.key === 'r' || e.key === 'R') && mode === 'edit') { tapRun = null; resetGame(); e.preventDefault(); }
     else if ((e.key === 'l' || e.key === 'L') && mode === 'edit') { setPencil(!pencil); e.preventDefault(); }
     else if ((e.key === 'x' || e.key === 'X') && mode === 'edit') { randomSpawners(); e.preventDefault(); }
-    else if ((e.key === 't' || e.key === 'T') && mode === 'edit' && !mod) { toggleCreatures(); e.preventDefault(); }
+    else if ((e.key === 't' || e.key === 'T') && mode === 'edit' && !mod) { toggleRun(); e.preventDefault(); }
     else if (e.key === 'h' || e.key === 'H' || e.key === '?') { showHint(!hintOn, false); e.preventDefault(); }
   });
   addEventListener('keyup', (e) => { const k = KEY_DIR[e.key]; if (k) keys.delete(k); });
@@ -2044,21 +2027,22 @@
     hintOn = on; hintEl.style.opacity = on ? '1' : '0'; clearTimeout(hintTimer);
     if (on && auto) hintTimer = setTimeout(() => showHint(false, false), 6000);
   }
-  const HINTS = { edit: 'drag to pan · drag objects to move · click colour · hold circle · L pencil · X random spawners · T dots/hunters/chasers on-off · scroll zoom · Ctrl+Z undo · R reset · Tab play',
+  const HINTS = { edit: 'drag to pan · drag objects to move · click colour · hold circle · L pencil · X random spawners · T run / pause · scroll zoom · Ctrl+Z undo · R reset · Tab play',
                   play: 'move cursor to steer · click to change background · Tab edit' };
   if (laptop) document.querySelector('#over small').textContent = 'Click or press Space to play again';
 
   // ----- Edit / Play -----
   const modeEls = { edit: document.getElementById('mEdit'), play: document.getElementById('mPlay') };
-  const penEl = document.getElementById('penBtn'), diceEl = document.getElementById('diceBtn'), creEl = document.getElementById('creBtn');
-  function setCreatures(on) {
-    creaturesOn = !!on; creEl.classList.toggle('off', !creaturesOn); creEl.setAttribute('aria-pressed', String(creaturesOn));
-    dirty = true;
+  const penEl = document.getElementById('penBtn'), diceEl = document.getElementById('diceBtn'), runEl = document.getElementById('runBtn');
+  // Edit's Run / Pause. Kept while in Play; back in Edit the world runs or not as before.
+  function setRun(on) {
+    editRun = !!on; runEl.classList.toggle('on', editRun); runEl.setAttribute('aria-pressed', String(editRun));
+    runEl.textContent = editRun ? '❚❚' : '▶'; runEl.setAttribute('aria-label', editRun ? 'Pause' : 'Run');
+    lastT = performance.now(); dirty = true;
   }
-  function toggleCreatures() {
+  function toggleRun() {
     if (mode !== 'edit') return;
-    setCreatures(!creaturesOn);
-    toast(creaturesOn ? 'Dots, hunters & chasers on' : 'Dots, hunters & chasers off');
+    setRun(!editRun); toast(editRun ? 'Running' : 'Paused');
   }
   function syncPlayer() {
     playerOn = playerWanted && (mode === 'play' || simInEdit);
@@ -2083,14 +2067,14 @@
     for (const k in modeEls) modeEls[k].classList.toggle('on', k === mode);
     penEl.style.display = mode === 'edit' ? '' : 'none';
     diceEl.style.display = mode === 'edit' ? '' : 'none';   // in Play the size reading sits there
-    creEl.style.display = mode === 'edit' ? '' : 'none';
+    runEl.style.display = mode === 'edit' ? '' : 'none';
     syncPlayer(); showScore();
     if (laptop) { hintEl.textContent = HINTS[mode]; showHint(true, true); }
   }
   function pressButton(el) {
     if (el.blur) el.blur();
     if (el === diceEl) randomSpawners();
-    else if (el === creEl) toggleCreatures();
+    else if (el === runEl) toggleRun();
     else if (el === penEl) { if (mode === 'edit') setPencil(!pencil); }
     else setMode(mode === 'edit' ? 'play' : 'edit');
   }
@@ -2117,7 +2101,7 @@
     get world() { updateWrap(); return { WX: world.WX, WY: world.WY, s: world.s, a: world.a, ox: world.ox, oy: world.oy, PX: PXv, PY: PYv, wrapping: WON, minScale: minScale() }; },
     get worldOn() { return worldOn; }, set worldOn(v) { worldOn = !!v; updateWrap(); },   // test hook: off = the old unbounded plane
     wrapNow: wrapAll, DOT_FLEE_RANGE, DOT_FLEE_SPEED, randomSpawners, get fps() { return fps; }, DOT_AGE_S,
-    get creaturesOn() { return creaturesOn; }, set creaturesOn(v) { setCreatures(v); }, toggleCreatures };
+    get editRun() { return editRun; }, set editRun(v) { setRun(v); }, toggleRun };
 </script>
 <script src="hud.js"></script>
 </body>
