@@ -22,6 +22,8 @@
     transition:color .4s,opacity .4s}
   #best.hi{color:#FFD54A;opacity:1}
   #overBest{display:block;font-size:14px;opacity:.9}
+  #overPast{display:block;margin-top:6px;font:500 12px/1.35 -apple-system,system-ui,sans-serif;opacity:.75}
+  #overPast:empty{display:none}
   #overBest i{font-style:normal;color:#FFD54A;margin-left:6px}
   #over{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;color:#fff;pointer-events:none;white-space:nowrap;width:max-content;
     font:600 16px/1.4 -apple-system,system-ui,sans-serif;background:rgba(0,0,0,.5);padding:22px 30px;border-radius:22px;display:none}
@@ -56,7 +58,7 @@
 <div id="bar"><button id="penBtn" title="Pencil: drag draws lines (L)" aria-pressed="false">✎</button><button id="modeBtn" title="Switch Edit / Play (Tab)"><span id="mEdit" class="on">Edit</span><span id="mPlay">Play</span></button><button id="diceBtn" title="Scatter random spawners over the world (X)" aria-label="Random spawners">🎲</button><button id="themeBtn" title="Muted / vivid colours (M)" aria-label="Muted colours" aria-pressed="false">◐</button><button id="runBtn" title="Run / pause the world while editing (T)" aria-label="Run" aria-pressed="false">▶</button></div>
 <div id="fps"></div>
 <div id="hint"></div>
-<div id="over"><b>Game over</b><span id="overScore"></span><span id="overBest"></span><small>Tap to play again</small></div>
+<div id="over"><b>Game over</b><span id="overScore"></span><span id="overBest"></span><span id="overPast"></span><small>Tap to play again</small></div>
 <div id="safe" style="position:fixed;visibility:hidden;pointer-events:none;padding-left:env(safe-area-inset-left,0px);padding-right:env(safe-area-inset-right,0px);padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)"></div>
 <script>
   const HOLD_MS = 500;         // how long to hold before a circle appears
@@ -95,6 +97,9 @@
   const TILT_SMOOTH_S = 0.08;  // smoothing time constant for the player's speed
   const INVULN_MS = 2000;      // blinking safe time after a restart (longer while a bigger circle still covers the spot)
   const NEUTRAL_MS = 300;      // tilt readings averaged for the neutral pose after load/restart
+
+  // Release number: bump on every release (high scores are kept per version, v44).
+  const APP_VERSION = 44;
 
   // ----- Colour -----
   // The background and every tapped circle each have their own hue, and no two
@@ -744,9 +749,10 @@
       const h = Math.floor(Math.random() * 360);   // any hue, the background's included
       const a = Math.random() * Math.PI * 2, v = d.r * (1.5 + Math.random() * 2);
       // Mixed sizes (some bigger than a new player); the older the dot, the bigger they can be.
-      // v41: uniform in radius between a fixed minimum and a maximum that grows with age (no cap),
-      // so even an old dot is as likely to release a small circle as a large one.
-      const r = d.r * (EMIT_MIN + Math.random() * (EMIT_MAX * (1 + (d.age || 0) / DOT_AGE_S) - EMIT_MIN));
+      // Between a fixed minimum and a maximum that grows with age (no cap, v41). v44: density
+      // proportional to 1/r (log-uniform): the smaller, the more likely.
+      const lo = EMIT_MIN, hi = EMIT_MAX * (1 + (d.age || 0) / DOT_AGE_S);
+      const r = d.r * lo * Math.pow(hi / lo, Math.random());
       const c = d.big
         ? { big: true, ox: d.ox + d.nx * (d.r - r), oy: d.oy + d.ny * (d.r - r), nx: d.nx, ny: d.ny, r }   // huge: centred on the dot
         : { cx: d.cx + Math.cos(a) * d.r * 0.05, cy: d.cy + Math.sin(a) * d.r * 0.05, r };
@@ -1515,11 +1521,39 @@
   // High score (v39): the highest peak size % reached in any Play run, kept in localStorage, so it is
   // per device and browser. Reset never clears it. With no record yet there is nothing to beat, so
   // the first run sets it quietly; after that, passing it updates it live with one 'New best!' per run.
-  const BEST_KEY = 'hueTap.best';
+  // v44: per version. BEST_KEY holds {version, best} for this release; ARCHIVE_KEY a list of
+  // {version, best, date} from earlier ones. A record from another version is archived on load
+  // and this version starts with no record. The pre-v44 single number (set on v39-v43) is
+  // archived as v43.
+  const BEST_KEY = 'hueTap.bestV', ARCHIVE_KEY = 'hueTap.bestArchive', LEGACY_BEST_KEY = 'hueTap.best';
   const bestEl = document.getElementById('best');
-  let shownBest = null, bestHiTimer = null;
+  let shownBest = null, bestHiTimer = null, bestArchive = [];
+  function archiveBest(version, b, date) {
+    if (!(b > 0)) return;
+    const old = bestArchive.find(a => a.version === version);
+    if (old) { if (b > old.best) { old.best = b; old.date = date; } }
+    else bestArchive.push({ version, best: b, date });
+    bestArchive.sort((a, b2) => b2.version - a.version);   // most recent first
+  }
   function loadBest() {
-    try { const v = Number(localStorage.getItem(BEST_KEY)); return v > 0 ? v : 0; } catch (e) { return 0; }
+    try {
+      try { const a = JSON.parse(localStorage.getItem(ARCHIVE_KEY)); if (Array.isArray(a)) bestArchive = a.filter(x => x && x.best > 0).sort((x, y) => y.version - x.version); } catch (e) {}
+      let changed = false;
+      const legacy = Number(localStorage.getItem(LEGACY_BEST_KEY));
+      if (localStorage.getItem(LEGACY_BEST_KEY) != null) {
+        if (legacy > 0) archiveBest(43, legacy, null);
+        localStorage.removeItem(LEGACY_BEST_KEY); changed = true;
+      }
+      let rec = null;
+      try { rec = JSON.parse(localStorage.getItem(BEST_KEY)); } catch (e) {}
+      let b = 0;
+      if (rec && typeof rec === 'object') {
+        if (rec.version === APP_VERSION) b = rec.best > 0 ? rec.best : 0;
+        else { archiveBest(rec.version, rec.best, rec.date || new Date().toISOString().slice(0, 10)); localStorage.removeItem(BEST_KEY); changed = true; }
+      }
+      if (changed) localStorage.setItem(ARCHIVE_KEY, JSON.stringify(bestArchive));
+      return b;
+    } catch (e) { return 0; }
   }
   let best = loadBest(), hadBest = best > 0;
   const run = { beat: false, toasted: false };      // this run beat a stored best / showed the toast
@@ -1528,7 +1562,7 @@
     const pk = Math.round(player.peak * 100);
     if (!(pk > best)) return;
     best = pk;
-    try { localStorage.setItem(BEST_KEY, String(best)); } catch (e) {}
+    try { localStorage.setItem(BEST_KEY, JSON.stringify({ version: APP_VERSION, best, date: new Date().toISOString().slice(0, 10) })); } catch (e) {}
     if (!hadBest) return;
     run.beat = true;
     if (!run.toasted) {
@@ -1553,6 +1587,14 @@
     const ob = document.getElementById('overBest');
     ob.textContent = best > 0 ? `Best ${best}%` : '';
     if (run.beat) { const i = document.createElement('i'); i.textContent = 'New best!'; ob.appendChild(i); }
+    // v44: earlier versions' bests (most recent first) and the all-time best if one beats this version's
+    const op = document.getElementById('overPast'); op.textContent = '';
+    if (bestArchive.length) {
+      const lines = ['Past bests'].concat(bestArchive.slice(0, 5).map(a => `v${a.version} · ${a.best}%`));
+      const top = bestArchive.reduce((m, a) => a.best > m.best ? a : m);
+      if (top.best > best) lines.push(`All-time best v${top.version} · ${top.best}%`);
+      lines.forEach((t, k) => { if (k) op.appendChild(document.createElement('br')); op.appendChild(document.createTextNode(t)); });
+    }
     overEl.style.display = 'block';
     dirty = true;
     if (navigator.vibrate) navigator.vibrate([40, 40, 120]);
@@ -2259,6 +2301,7 @@
   function setPencil(on) {
     pencil = !!on; penEl.classList.toggle('on', pencil); penEl.setAttribute('aria-pressed', String(pencil));
   }
+  let editZoom = null;          // Edit's zoom (world.s) when Play began
   function setMode(m) {
     if (m !== 'edit' && m !== 'play') return;
     endPress(false); endDot(false); cancelTwoHold(); restartTap = null; playTap = null; tapRun = null; lastTwoTap = null;
@@ -2267,9 +2310,15 @@
       if (mode === 'play') {          // a fresh run on the world as it is
         // v42: no snap, Play starts at whatever zoom Edit was left at (tiled if zoomed out past one
         // world); the player starts 12 px across on screen as always.
+        editZoom = worldOn ? world.s : null;   // v44: given back on return to Edit
         forcesOn = true; restart(); keys.clear();
       } else {                        // freeze where it is
         forcesOn = false; player.vx = 0; player.vy = 0;
+        // v44: back to the zoom Edit had before Play. Play's auto zoom-out can leave the world a
+        // few px (or 0.001 px) across; Edit then showed only background and pinching out
+        // changed nothing visible ("can't zoom out in Edit").
+        if (worldOn && editZoom > 0 && isFinite(editZoom)) transformAll(editZoom / world.s, W / 2, H / 2, 0, 0);
+        editZoom = null;
       }
       lastT = performance.now();
     }
@@ -2303,7 +2352,7 @@
     get player() { return { x: W / 2, y: H / 2, r: player.r, eaten: player.eaten, score: sizePct(), peak: Math.round(player.peak * 100), caught: player.caught, size: player.size, gameOver: player.over,
       invulnerable: invulnerable(performance.now()), huntSafe: huntSafe(performance.now()), guard: player.guard, scale: player.scale, vx: player.vx, vy: player.vy,
       tilt: [tiltX, tiltY], neutral: neutral && [neutral.beta, neutral.gamma], on: playerOn }; },
-    get best() { return best; }, BEST_KEY, redraw() { dirty = true; }, get muted() { return muted; }, set muted(v) { setMuted(v); }, THEME_KEY, MUTED_BG, tc,
+    get best() { return best; }, BEST_KEY, ARCHIVE_KEY, LEGACY_BEST_KEY, APP_VERSION, get bestArchive() { return bestArchive.map(a => ({ ...a })); }, redraw() { dirty = true; }, get muted() { return muted; }, set muted(v) { setMuted(v); }, THEME_KEY, MUTED_BG, tc,
     emitStats, resetGame, spawnWait, SPAWNER_MEAN_S, laptop, get cursor() { return cursor; }, get mouseHeld() { return mouseHeld; },
     get steering() { return steering; }, get hintOn() { return hintOn; },
     playerObj: player, setTilt: onTilt, restart,
