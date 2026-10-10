@@ -645,6 +645,14 @@
   }
   const awakeList = [];
 
+  // v44: hunters and chasers (no velocity of their own) are pushed back out of lines too.
+  const lineList = [];
+  function blockLines(list) {
+    if (!strokes.length) return;
+    lineList.length = 0;
+    for (const c of list) if (!c.big && c.r > 0 && c.r <= BIG && isFinite(c.cx) && isFinite(c.cy)) lineList.push(c);
+    if (lineList.length) { collideLines(lineList); dirty = true; }
+  }
   // Keep circles on their side of every line: push out and bounce off.
   function collideLines(bodies) {
     for (const st of strokes) {
@@ -1145,6 +1153,7 @@
         tgt = null;
       }
     }
+    blockLines(active);                // v44: lines block hunters (only the player passes them)
     for (const c of born) { hunters.push(c); history.push({ type: 'hunter', obj: c }); hunterBorn(); }   // clones count towards chasers
     if (!popped) return;
     let w = 0;
@@ -1193,6 +1202,7 @@
         tgt = null; c.target = null;
       }
     }
+    blockLines(active);                // v44: and chasers
     if (!popped) return;
     let w = 0;
     for (const h of hunters) if (!popped.has(h)) hunters[w++] = h;
@@ -1383,13 +1393,9 @@
     if (!playerOn || player.over || (!player.vx && !player.vy)) return;
     const mx = player.vx * dt, my = player.vy * dt, r = player.r;
     pBody.cx = W / 2; pBody.cy = H / 2; pBody.r = r;
-    const solid = strokes.length && r > 0 && r <= BIG;
-    // Small steps (half a radius at most) so the player can't jump through a line.
-    const n = solid ? Math.min(64, Math.max(1, Math.ceil(Math.hypot(mx, my) / (0.5 * r)))) : 1;
-    for (let i = 0; i < n; i++) {
-      pBody.cx += mx / n; pBody.cy += my / n;
-      if (solid) collideLines([pBody]);     // pushed back out: the part of the move into the line is removed
-    }
+    // v44: drawn lines are permeable to the player only (they still block everything else),
+    // so it simply moves; no line collisions here.
+    pBody.cx += mx; pBody.cy += my;
     const dx = pBody.cx - W / 2, dy = pBody.cy - H / 2;
     if (dx || dy) transformAll(1, 0, 0, -dx, -dy);
   }
@@ -1487,7 +1493,7 @@
   // is destroyed, the player shrinks by 15% (not
   // below half its start size) and is safe from hunters for 1 s. A catch never ends the game.
   const CATCH_SAFE_MS = 1000;
-  const CATCH_SHRINK = 0.15;    // a catch takes this fraction off the player's radius ...
+  const CATCH_SHRINK = 0.5;     // a catch takes this fraction off the player's radius (v44: half, was 15%) ...
   const CATCH_MIN_SIZE = 0.5;   // ... but never below this fraction of the start radius
   const huntSafe = (now) => now < player.huntSafeUntil;
   function catchStep(now) {
