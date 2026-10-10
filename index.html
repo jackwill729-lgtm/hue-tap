@@ -297,11 +297,11 @@
   // Rotate everything by angle a (radians) and scale by k around screen point
   // (px, py), then move by (dx, dy).
   function transformAll(k, px, py, dx, dy, a = 0) {
-    // Play: zooming out stops once the world just fills the screen. Edit: no limit to
-    // speak of (the world can shrink to a thousandth of a pixel, past which the numbers
-    // would start to lose it). Zooming in has no limit.
+    // Zooming out has no limit to speak of, in Edit and (v42) Play alike: the world can
+    // shrink to a thousandth of a pixel, past which the numbers would start to lose it.
+    // Zooming in has no limit.
     if (worldOn && k < 1) {
-      const lo = mode === 'play' ? minScale() : MIN_WORLD_PX / Math.min(world.WX, world.WY);
+      const lo = MIN_WORLD_PX / Math.min(world.WX, world.WY);
       if (world.s * k < lo) k = Math.min(1, lo / world.s);
     }
     world.s *= k; world.a += a;
@@ -385,7 +385,7 @@
     const c = Math.cos(world.a), s = Math.sin(world.a), hx = world.WX * world.s / 2, hy = world.WY * world.s / 2;
     world.ox = W / 2 - hx * c + hy * s; world.oy = H / 2 - hx * s - hy * c;
   }
-  const MIN_WORLD_PX = 1e-3;     // Edit: the world can shrink to this many px across, no further
+  const MIN_WORLD_PX = 1e-3;     // Edit and Play: the world can shrink to this many px across, no further
   const SEAM_MIN_PX = 8;         // the seam guide is left out once the world is smaller than this
   const minScale = () => Math.hypot(W, H) / Math.min(world.WX, world.WY);   // the world must cover the screen diagonal
   function updateWrap() {
@@ -1390,16 +1390,18 @@
   // Play: the view zooms with the player's size so it settles back to its start size
   // (12 px) on screen. Growing is deliberately laggy: the player visibly grows first,
   // then after a short pause the world eases out about it. (A catch's shrink zooms
-  // back in at once, in catchStep; this eases in too if it's ever left small.) Zoom-out stops at the
-  // world-covers-screen limit; past that the player just looks bigger.
+  // back in at once, in catchStep; this eases in too if it's ever left small.) v42: zoom-out is
+  // continuous: past one world the view tiles copies of it, as in Edit. Only at the 0.001 px
+  // world floor does it stop, and past that the player just looks bigger.
   const SIZE_ZOOM_DELAY_MS = 300;   // pause after a size change before the view follows
   const SIZE_ZOOM_S = 1.5;          // then an exponential ease with this time constant
   function sizeZoom(dt, now) {
     if (mode !== 'play' || !playerOn || player.over || !(player.r > 0) || !isFinite(player.r)) return;
     if (now - player.sizeT < SIZE_ZOOM_DELAY_MS) return;
     const want = PLAYER_R / player.r;
+    if (Math.abs(Math.log(want)) < 1e-3) player.lagging = false;   // caught up (near enough)
     if (Math.abs(Math.log(want)) < 1e-6) return;
-    if (want < 1 && worldOn && world.s <= minScale() * (1 + 1e-9)) return;    // at the zoom-out limit
+    if (want < 1 && worldOn && world.s <= MIN_WORLD_PX / Math.min(world.WX, world.WY) * (1 + 1e-9)) return;    // at the world floor
     const k = Math.pow(want, 1 - Math.exp(-dt / SIZE_ZOOM_S));
     transformAll(Math.abs(Math.log(want)) < 1e-3 ? want : k, W / 2, H / 2, 0, 0);
   }
@@ -1424,7 +1426,9 @@
       player.r += 0.1 * c.r;                      // and grows by a tenth of what it ate (speed stays in start radii)
       player.size = player.r / (PLAYER_R * player.scale);
       if (player.size > player.peak) { player.peak = player.size; notePeak(); }
-      player.sizeT = now;                         // the view follows after a pause
+      // the view follows after a pause, timed from the first growth it hasn't caught up with
+      // (v42: eating every frame, e.g. a player bigger than the world, mustn't hold the zoom off forever)
+      if (!player.lagging) { player.sizeT = now; player.lagging = true; }
       (gone || (gone = new Set())).add(c);
       pops.push({ x: c.cx, y: c.cy, r: c.r, color: '#FFFFFF', t0: now });
     }
@@ -1556,7 +1560,7 @@
   function restart() {
     newRun();
     spawnedHunters = 0;              // a fresh run: the chaser count starts again
-    Object.assign(player, { r: PLAYER_R, scale: 1, eaten: 0, peak: 1, caught: 0, size: 1, sizeT: 0, over: false, vx: 0, vy: 0, guard: true, covered: false, huntSafeUntil: 0,
+    Object.assign(player, { r: PLAYER_R, scale: 1, eaten: 0, peak: 1, caught: 0, size: 1, sizeT: 0, lagging: false, over: false, vx: 0, vy: 0, guard: true, covered: false, huntSafeUntil: 0,
                             invUntil: performance.now() + INVULN_MS });
     neutral = null; calib = null; tiltX = 0; tiltY = 0;   // the next 0.3 s of readings set the new neutral pose
     overEl.style.display = 'none';
@@ -1639,7 +1643,9 @@
       dirty = false;
       ctx.clearRect(0, 0, W, H);
       const sx = W / 2, sy = H / 2, diag = Math.hypot(W, H);
-      tiled = WON && mode === 'edit' && world.s < minScale() * (1 - 1e-9);   // Edit, zoomed out past one world
+      // Zoomed out past one world (Edit, or v42 Play): copies of the world tile the screen. The
+      // player is drawn once, at the centre (it is the camera), not in every copy.
+      tiled = WON && world.s < minScale() * (1 - 1e-9);
       if (tiled) drawTiled(now); else drawWorld();
       drawPlayer(now);
       if (mode === 'edit') drawDot({ cx: dockX, cy: dockY, r: DOT_R });   // the corner dot (Edit only)
@@ -2259,8 +2265,8 @@
     if (m !== mode) {
       mode = m;
       if (mode === 'play') {          // a fresh run on the world as it is
-        // Edit may be zoomed out past Play's limit: straight back in to it, about the centre.
-        if (worldOn && world.s < minScale()) transformAll(minScale() / world.s, W / 2, H / 2, 0, 0);
+        // v42: no snap, Play starts at whatever zoom Edit was left at (tiled if zoomed out past one
+        // world); the player starts 12 px across on screen as always.
         forcesOn = true; restart(); keys.clear();
       } else {                        // freeze where it is
         forcesOn = false; player.vx = 0; player.vy = 0;
