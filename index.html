@@ -1423,7 +1423,7 @@
       const d = Math.sqrt(d2);
       if (d + c.r > P && lensFrac(P, c.r, d) <= 0.5) continue;
       player.eaten++;
-      player.r += 0.1 * c.r;                      // and grows by a tenth of what it ate (speed stays in start radii)
+      player.r += 0.01 * c.r;                     // v43: grows by 1% of what it ate's radius (speed stays in start radii)
       player.size = player.r / (PLAYER_R * player.scale);
       if (player.size > player.peak) { player.peak = player.size; notePeak(); }
       // the view follows after a pause, timed from the first growth it hasn't caught up with
