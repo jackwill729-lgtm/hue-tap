@@ -79,9 +79,10 @@
   const POP_S = 0.25;          // length of the pop animation
   const CLONE_EVERY = 20;      // a hunter clones itself every this many pops
   const DOT_FLEE_RANGE = 150;  // black dots run from anything whose edge is within this (px at the starting zoom)
+  const DOT_FLEE_CIRCLE_RANGE = 450;   // v45: ... but coloured circles they want nowhere near: 3x the range
+  const DOT_FLEE_CIRCLE_SPEED = 200;   // ... and twice the top speed (px/s at the starting zoom)
   const DOT_FLEE_SPEED = 100;  // their top speed, px/s at the starting zoom: about a fleeing coloured circle's
   const DOT_DAMPING = 2.5;     // per second, so they settle soon after the danger has gone
-  const DOT_OWN_MS = 1000;     // a dot ignores circles it released this recently
   const DOT_AGE_S = 60;        // a black dot's circles grow by their base size every this many seconds it has been running
   const EMIT_MEAN_S = 1.2;     // average time between circles from one dot while forces are on
   const FRAME_BUDGET_MS = 12;  // physics time per frame; beyond this the simulation slows rather than freezes
@@ -708,32 +709,37 @@
   // circles. Scaled with zoom, so it looks the same at any zoom.
   function dotFlee(dt, now) {
     if (!dots.length) return;
-    const s = world.s, R = DOT_FLEE_RANGE * s, A = DOT_FLEE_SPEED * DOT_DAMPING * s, f = Math.exp(-DOT_DAMPING * dt);
+    const s = world.s, R = DOT_FLEE_RANGE * s, RC = DOT_FLEE_CIRCLE_RANGE * s, KC = DOT_FLEE_CIRCLE_SPEED / DOT_FLEE_SPEED, A = DOT_FLEE_SPEED * DOT_DAMPING * s, f = Math.exp(-DOT_DAMPING * dt);
     if (!(R > 0) || !isFinite(R)) return;
     const pl = playerLive() ? { cx: W / 2, cy: H / 2, r: player.r } : null;
     const held = press && press.obj, moved = [];
     for (const d of dots) {
       if (d.big || !(d.r > 0) || d === held || !isFinite(d.cx) || !isFinite(d.cy)) continue;
-      let ax = 0, ay = 0, threat = false;
-      const push = (o) => {
+      let ax = 0, ay = 0, threat = false, cap = 1;
+      // circle: v45 circles (coloured or white) scare them far more (3x range, strong throughout, steep close up, 2x speed)
+      const push = (o, circle) => {
         if (o.big || !(o.r > 0)) return;
+        const Rr = circle ? RC : R;
         let dx = d.cx - o.cx, dy = d.cy - o.cy;
         if (WON) { mi(dx, dy); dx = MX; dy = MY; }
-        const lim = R + d.r + o.r;
+        const lim = Rr + d.r + o.r;
         if (!(Math.abs(dx) < lim && Math.abs(dy) < lim)) return;
         const dist = Math.sqrt(dx * dx + dy * dy), gap = dist - d.r - o.r;
-        if (!(gap < R)) return;
-        const q = 1 - Math.max(0, gap) / R, w = 0.25 + 0.75 * q * q;   // a floor, so they clear the range and stop rather than creep
+        if (!(gap < Rr)) return;
+        const q = 1 - Math.max(0, gap) / Rr;
+        // a floor, so they clear the range and stop rather than creep
+        const w = circle ? KC * (0.5 + 0.5 * q * q) : 0.25 + 0.75 * q * q;
+        if (circle) cap = KC;
         threat = true;
         if (dist > 0) { ax += dx / dist * w; ay += dy / dist * w; }
         else { const t = Math.random() * Math.PI * 2; ax += Math.cos(t) * w; ay += Math.sin(t) * w; }
       };
-      for (const c of circles) if (!(c.src === d && now - c.born < DOT_OWN_MS)) push(c);
+      for (const c of circles) push(c, true);   // v45: its own fresh circles too
       for (const h of hunters) push(h);
       for (const c of chasers) push(c);
       if (pl) push(pl);
       const L = Math.hypot(ax, ay);
-      if (L > 1) { ax /= L; ay /= L; }
+      if (L > cap) { ax *= cap / L; ay *= cap / L; }
       d.vx = ((d.vx || 0) + ax * A * dt) * f; d.vy = ((d.vy || 0) + ay * A * dt) * f;
       if (!threat && d.vx * d.vx + d.vy * d.vy < (0.05 * d.r) ** 2) { d.vx = 0; d.vy = 0; continue; }   // at rest
       if (!d.vx && !d.vy) continue;
@@ -762,7 +768,7 @@
       const r = d.r * lo * Math.pow(hi / lo, Math.random());
       const c = d.big
         ? { big: true, ox: d.ox + d.nx * (d.r - r), oy: d.oy + d.ny * (d.r - r), nx: d.nx, ny: d.ny, r }   // huge: centred on the dot
-        : { cx: d.cx + Math.cos(a) * d.r * 0.05, cy: d.cy + Math.sin(a) * d.r * 0.05, r };
+        : { cx: d.cx + Math.cos(a) * (d.r + r) * 1.02, cy: d.cy + Math.sin(a) * (d.r + r) * 1.02, r };   // v45: just outside the dot (it runs from it at once)
       c.hue = h; c.color = hsl(h); c.vx = Math.cos(a) * v; c.vy = Math.sin(a) * v;
       c.src = d; c.born = performance.now();       // its dot ignores it for a moment (dots run from circles)
       circles.push(c);
@@ -1651,21 +1657,22 @@
     for (const s of shots) {
       const age = now - s.t0;
       if (age > SHOT_LIFE_MS + SHOT_FADE_MS || !isFinite(s.cx)) continue;
-      s.cx += s.vx * dt; s.cy += s.vy * dt;
+      const mx = s.vx * dt, my = s.vy * dt, mm = mx * mx + my * my;
+      // swept: the closest the shot came to (x, y) during this frame's move (it is fast enough to skip over a hunter)
+      const sweep = (x, y) => { mi(x - s.cx, y - s.cy); const t = mm > 0 ? Math.max(0, Math.min(1, (MX * mx + MY * my) / mm)) : 0; return Math.hypot(MX - t * mx, MY - t * my); };
       let hit = -1;
       if (age <= SHOT_LIFE_MS) for (let i = 0; i < hunters.length; i++) {
         const h = hunters[i];
         if (h.big || !(h.r > 0)) continue;
-        mi(h.cx - s.cx, h.cy - s.cy);
-        if (Math.hypot(MX, MY) <= (h.r + s.r) * (1 + 1e-9)) { hit = i; break; }
+        if (sweep(h.cx, h.cy) <= (h.r + s.r) * (1 + 1e-9)) { hit = i; break; }
       }
       if (hit < 0 && age <= SHOT_LIFE_MS) {        // v45: it also pops the first coloured circle it touches (any size)
         let ci = -1;
         for (let i = circles.length - 1; i >= 0; i--) {
           const c = circles[i];
           if (c.hue == null || !(c.r > 0)) continue;   // white circles (no colour) let it through
-          if (c.big ? (s.cx - c.ox) * c.nx + (s.cy - c.oy) * c.ny >= -s.r
-                    : (mi(c.cx - s.cx, c.cy - s.cy), Math.hypot(MX, MY) <= (c.r + s.r) * (1 + 1e-9))) { ci = i; break; }
+          if (c.big ? (s.cx + mx - c.ox) * c.nx + (s.cy + my - c.oy) * c.ny >= -s.r
+                    : sweep(c.cx, c.cy) <= (c.r + s.r) * (1 + 1e-9)) { ci = i; break; }
         }
         if (ci >= 0) {
           const c = circles[ci];
@@ -1684,6 +1691,7 @@
         shotKills++; dirty = true;
         continue;                                  // the shot is used up
       }
+      s.cx += mx; s.cy += my;
       shots[w++] = s;
     }
     shots.length = w;
@@ -2450,7 +2458,7 @@
     // the wrapping world: size in load px, scale, angle, guide origin; period on screen now
     get world() { updateWrap(); return { WX: world.WX, WY: world.WY, s: world.s, a: world.a, ox: world.ox, oy: world.oy, PX: PXv, PY: PYv, wrapping: WON, minScale: minScale() }; },
     get worldOn() { return worldOn; }, set worldOn(v) { worldOn = !!v; updateWrap(); },   // test hook: off = the old unbounded plane
-    wrapNow: wrapAll, DOT_FLEE_RANGE, DOT_FLEE_SPEED, randomSpawners, get fps() { return fps; }, DOT_AGE_S,
+    wrapNow: wrapAll, DOT_FLEE_RANGE, DOT_FLEE_SPEED, DOT_FLEE_CIRCLE_RANGE, DOT_FLEE_CIRCLE_SPEED, randomSpawners, get fps() { return fps; }, DOT_AGE_S,
     get tiled() { return tiled; }, tileStats, get tileCanvas() { return [tileC ? [tileC.width, tileC.height] : null, patC ? [patC.width, patC.height] : null]; }, get chaserStarve() { return chaserStarve; }, set chaserStarve(v) { chaserStarve = !!v; }, MIN_WORLD_PX, get spawnedHunters() { return spawnedHunters; }, set spawnedHunters(v) { spawnedHunters = +v; }, CHASER_EVERY, get editRun() { return editRun; }, set editRun(v) { setRun(v); }, toggleRun };
 </script>
 <script src="hud.js"></script>
