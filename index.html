@@ -10,7 +10,7 @@
 <style>
   html,body{margin:0;height:100%;overflow:hidden;touch-action:none;overscroll-behavior:none;
     -webkit-tap-highlight-color:transparent;-webkit-touch-callout:none;user-select:none;-webkit-user-select:none}
-  body{background:hsl(170,70%,55%);transition:background-color .35s ease;cursor:pointer}
+  body{background:hsl(35,70%,28%);transition:background-color .35s ease;cursor:pointer}
   canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
   #toast{position:fixed;left:50%;bottom:calc(28px + env(safe-area-inset-bottom));transform:translateX(-50%);
     font:600 15px/1 -apple-system,system-ui,sans-serif;color:#fff;background:rgba(0,0,0,.45);padding:10px 16px;
@@ -99,7 +99,7 @@
   const NEUTRAL_MS = 300;      // tilt readings averaged for the neutral pose after load/restart
 
   // Release number: bump on every release (high scores are kept per version, v44).
-  const APP_VERSION = 44;
+  const APP_VERSION = 45;
 
   // ----- Colour -----
   // The background and every tapped circle each have their own hue, and no two
@@ -117,12 +117,13 @@
     }
     return Math.floor(Math.random() * 360);
   }
-  let hue = Math.floor(Math.random() * 360);
+  // v45: the background is constant (dark amber, or the muted grey) and its physics hue
+  // (which sets how permeable it is to coloured circles) is fixed at 35°.
+  const BG_HUE = 35, VIVID_BG = 'hsl(35,70%,28%)';
+  let hue = BG_HUE;
   const theme = document.querySelector('meta[name=theme-color]');
   // Muted theme (v40): only how things are drawn. A calm fixed grey background and pastel
-  // versions of every colour (same hue, softer), gentler pulses. The real hues (and the
-  // background hue that sets permeability) are untouched, and the background hue is frozen
-  // while muted: background taps/clicks do nothing. Saved per device in localStorage.
+  // versions of every colour (same hue, softer), gentler pulses. The real hues are untouched.
   const THEME_KEY = 'hueTap.theme', MUTED_BG = '#8b9097', MUTED_LINE = '#4f535a';
   let muted = false;
   try { muted = localStorage.getItem(THEME_KEY) === 'muted'; } catch (e) {}
@@ -153,11 +154,8 @@
   }
   function paint() {
     document.documentElement.classList.toggle('muted', muted);
-    document.body.style.backgroundColor = muted ? MUTED_BG : hsl(hue);
-    theme.setAttribute('content', muted ? MUTED_BG : hsl(hue));
-  }
-  function nextHue() {
-    hue = randomHue([hue], 40); paint();
+    document.body.style.backgroundColor = muted ? MUTED_BG : VIVID_BG;
+    theme.setAttribute('content', muted ? MUTED_BG : VIVID_BG);
   }
   paint();
 
@@ -167,6 +165,7 @@
   // nearest the screen, plus the direction to the centre", re-anchored every
   // frame, so their edges stay sharp however far you zoom in.
   const BIG = 2e6, SMALL = 1e6;
+  const shots = [];    // v45: the player's shots {cx, cy, r, vx, vy, t0}
   const circles = [];  // {cx, cy, r, color, hue} or {big:true, ox, oy, nx, ny, r, color, hue}
   // Lines: pts is a flat [x0, y0, x1, y1, ...] smoothed polyline in screen
   // coordinates, w its thickness. raw holds the finger points while drawing.
@@ -314,7 +313,7 @@
       world.ox = px + x * c - y * s + dx; world.oy = py + x * s + y * c + dy; }
     const cos = Math.cos(a) * k, sin = Math.sin(a) * k;
     const cs = Math.cos(a), sn = Math.sin(a);
-    for (const c of circles.concat(dots, hunters, chasers, spawners)) {
+    for (const c of circles.concat(dots, hunters, chasers, spawners, shots)) {
       if (c.big) {
         const x = c.ox - px, y = c.oy - py;
         c.ox = px + x * cos - y * sin + dx; c.oy = py + x * sin + y * cos + dy;
@@ -427,7 +426,7 @@
     updateWrap();
     if (!WON) return;
     const sx = W / 2, sy = H / 2;
-    for (const list of [circles, dots, hunters, chasers, spawners]) for (const c of list) {
+    for (const list of [circles, dots, hunters, chasers, spawners, shots]) for (const c of list) {
       if (c.big || !isFinite(c.cx) || !isFinite(c.cy)) continue;
       const rx = c.cx - sx, ry = c.cy - sy;
       mi(rx, ry);
@@ -1266,6 +1265,7 @@
         octx.stroke(); octx.globalAlpha = 1;
       }
     }
+    drawShots(now);
     for (let i = pops.length - 1; i >= 0; i--) {
       const p = pops[i], t = Math.max(0, (now - p.t0) / 1000 / POP_S);
       if (t >= 1) { pops.splice(i, 1); continue; }
@@ -1607,12 +1607,97 @@
   }
   function restart() {
     newRun();
+    shots.length = 0; lastShot = -1e9;
     spawnedHunters = 0;              // a fresh run: the chaser count starts again
     Object.assign(player, { r: PLAYER_R, scale: 1, eaten: 0, peak: 1, caught: 0, size: 1, sizeT: 0, lagging: false, over: false, vx: 0, vy: 0, guard: true, covered: false, huntSafeUntil: 0,
                             invUntil: performance.now() + INVULN_MS });
     neutral = null; calib = null; tiltX = 0; tiltY = 0;   // the next 0.3 s of readings set the new neutral pose
     overEl.style.display = 'none';
     dirty = true;
+  }
+  // ----- Shooting (v45, Play) -----
+  // A quick tap/click fires 1% of the player's mass (area) towards that point: a shot of
+  // radius 0.1·R, the player's radius × √0.99. Not below the 50% floor (a small fizzle instead).
+  // Shots fly straight at 3× the player's top speed (wrapping) for 1.5 s then fade out. A shot
+  // touching a hunter destroys it, one touching a coloured circle (any size) pops it; either way
+  // the shot is used up. White circles, chasers, dots, spawners and lines it passes through.
+  const SHOT_MASS = 0.01, SHOT_SPEED = 3, SHOT_LIFE_MS = 1500, SHOT_FADE_MS = 300, SHOT_COOLDOWN_MS = 150;
+  let lastShot = -1e9, shotsFired = 0, shotKills = 0, shotPops = 0, fizzles = 0;
+  function shoot(x, y, now) {
+    if (mode !== 'play' || !playerLive() || player.over) return false;
+    if (now - lastShot < SHOT_COOLDOWN_MS) return false;
+    const ex = x - W / 2, ey = y - H / 2, m = Math.hypot(ex, ey);
+    if (!(m > 0) || !(player.r > 0) || !isFinite(player.r)) return false;
+    lastShot = now;
+    const k = Math.sqrt(1 - SHOT_MASS), floor = CATCH_MIN_SIZE * PLAYER_R * player.scale;
+    const ux = ex / m, uy = ey / m;
+    if (player.r * k < floor * (1 - 1e-9)) {      // too small to spare the mass: a brief fizzle
+      fizzles++;
+      pops.push({ x: W / 2 + ux * player.r * 1.2, y: H / 2 + uy * player.r * 1.2, r: Math.max(2, player.r * 0.15), color: '#9a9a9a', t0: now });
+      return false;
+    }
+    const r = Math.sqrt(SHOT_MASS) * player.r;
+    player.r *= k;
+    player.size = player.r / (PLAYER_R * player.scale);
+    if (!player.lagging) { player.sizeT = now; player.lagging = true; }
+    const sp = SHOT_SPEED * TILT_MAX_RADII * PLAYER_R;   // screen px/s at launch (3x the player's top speed)
+    shots.push({ cx: W / 2 + ux * (player.r + r), cy: H / 2 + uy * (player.r + r), r, vx: ux * sp, vy: uy * sp, t0: now });
+    shotsFired++; dirty = true;
+    return true;
+  }
+  function shotStep(dt, now) {
+    if (!shots.length) return;
+    let w = 0;
+    for (const s of shots) {
+      const age = now - s.t0;
+      if (age > SHOT_LIFE_MS + SHOT_FADE_MS || !isFinite(s.cx)) continue;
+      s.cx += s.vx * dt; s.cy += s.vy * dt;
+      let hit = -1;
+      if (age <= SHOT_LIFE_MS) for (let i = 0; i < hunters.length; i++) {
+        const h = hunters[i];
+        if (h.big || !(h.r > 0)) continue;
+        mi(h.cx - s.cx, h.cy - s.cy);
+        if (Math.hypot(MX, MY) <= (h.r + s.r) * (1 + 1e-9)) { hit = i; break; }
+      }
+      if (hit < 0 && age <= SHOT_LIFE_MS) {        // v45: it also pops the first coloured circle it touches (any size)
+        let ci = -1;
+        for (let i = circles.length - 1; i >= 0; i--) {
+          const c = circles[i];
+          if (c.hue == null || !(c.r > 0)) continue;   // white circles (no colour) let it through
+          if (c.big ? (s.cx - c.ox) * c.nx + (s.cy - c.oy) * c.ny >= -s.r
+                    : (mi(c.cx - s.cx, c.cy - s.cy), Math.hypot(MX, MY) <= (c.r + s.r) * (1 + 1e-9))) { ci = i; break; }
+        }
+        if (ci >= 0) {
+          const c = circles[ci];
+          circles.splice(ci, 1);
+          const k = history.findIndex(it => it.obj === c); if (k >= 0) history.splice(k, 1);
+          if (!c.big) pops.push({ x: c.cx, y: c.cy, r: c.r, color: c.color, t0: now });
+          shotPops++; dirty = true;
+          continue;
+        }
+      }
+      if (hit >= 0) {
+        const h = hunters[hit];
+        hunters.splice(hit, 1);
+        const k = history.findIndex(it => it.obj === h); if (k >= 0) history.splice(k, 1);
+        pops.push({ x: h.cx, y: h.cy, r: h.r * 1.5, color: '#ff2a2a', t0: now });
+        shotKills++; dirty = true;
+        continue;                                  // the shot is used up
+      }
+      shots[w++] = s;
+    }
+    shots.length = w;
+  }
+  function drawShots(now) {
+    for (const s of shots) {
+      const age = now - s.t0, a = age <= SHOT_LIFE_MS ? 1 : Math.max(0, 1 - (age - SHOT_LIFE_MS) / SHOT_FADE_MS);
+      if (!(a > 0)) continue;
+      octx.globalAlpha = a;
+      octx.fillStyle = muted ? '#f6f4ef' : '#FFFFFF';
+      octx.shadowColor = muted ? 'rgba(255,255,255,.4)' : 'rgba(255,255,255,.9)'; octx.shadowBlur = Math.min(8, s.r * 2);
+      octx.beginPath(); octx.arc(s.cx, s.cy, Math.max(1.5, s.r), 0, Math.PI * 2); octx.fill();
+    }
+    octx.shadowBlur = 0; octx.shadowColor = 'transparent'; octx.globalAlpha = 1;
   }
   // White with a soft glow and a thin dark ring, so it never looks like a white circle.
   function drawPlayer(now) {
@@ -1683,6 +1768,7 @@
       playerStep(now);
       if (dt > 0) { huntStep(dt, now); chaseStep(dt, now); starveChasers(now); }
       catchStep(now);
+      if (dt > 0) shotStep(dt, now);
     }
     holdDragged();                               // what's being dragged stays under the finger
     if (playerOn && (invulnerable(now) || huntSafe(now))) dirty = true;   // blinking
@@ -1964,10 +2050,10 @@
     }
     return null;
   }
-  // Tap on a circle: give it a new hue. Tap on the background: change the background's hue.
+  // Tap on a circle: give it a new hue. Tap on the background: nothing (v45).
   function handleTap(x, y) {
     const hit = circleAt(x, y);
-    if (!hit) { if (!muted) nextHue(); return; }   // muted: the background hue is frozen
+    if (!hit) return;   // v45: the background never changes colour
     const h = hit.hue == null ? Math.floor(Math.random() * 360) : randomHue([hit.hue], 40);
     hit.hue = h; hit.color = hsl(h);
     dirty = true;
@@ -2046,7 +2132,6 @@
     if (dotDrag) dotDrag = null;
     spawnedHunters = 0;
     setRun(false);                   // Edit's world paused again
-    hue = Math.floor(Math.random() * 360); paint();
     restart();                       // player in the middle, 100%, immune for a moment, tilt re-calibrates
     recentreWorld();                 // same world size; its guide edges laid out around the view again
     dirty = true;
@@ -2119,7 +2204,7 @@
     if (ui && touches.size === 0 && !uiTouch && e.changedTouches.length === 1) { uiTouch = { id: e.changedTouches[0].identifier, el: ui }; return; }
     if (touches.size === 0) firstDownT = performance.now();
     for (const t of e.changedTouches) touches.set(t.identifier, { x: t.clientX, y: t.clientY });
-    if (mode !== 'edit') {     // Play: no editing or navigation; a tap changes the background, or restarts after game over
+    if (mode !== 'edit') {     // Play: no editing or navigation; a tap shoots, or restarts after game over
       const t = e.changedTouches[0];
       playTap = null;
       if (touches.size === 1 && playerOn && player.over) restartTap = t.identifier;
@@ -2175,12 +2260,12 @@
   }, opts);
   function cancelTwoHold() { if (twoHold) { clearTimeout(twoHold.timer); twoHold = null; } }
   let restartTap = null;      // the finger of a tap that will restart after game over
-  // Play: a quick tap or click (not a hold or drag) gives the background a new random hue.
+  // Play: a quick tap or click (not a hold or drag) shoots towards it (v45).
   let playTap = null;         // {id, x0, y0, t0}
   function dragOffTap(x, y) { if (playTap && Math.hypot(x - playTap.x0, y - playTap.y0) >= DRAG_PX) playTap = null; }
   function endPlayTap(ok) {
     const p = playTap; playTap = null;
-    if (ok && p && mode === 'play' && !player.over && performance.now() - p.t0 < HOLD_MS) { if (!muted) nextHue(); dirty = true; }
+    if (ok && p && mode === 'play' && !player.over && performance.now() - p.t0 < HOLD_MS) { shoot(p.x0, p.y0, performance.now()); dirty = true; }
   }
   function liftTouches(e, cancelled) {
     cancelTwoHold();
@@ -2270,9 +2355,8 @@
     if (on && auto) hintTimer = setTimeout(() => showHint(false, false), 6000);
   }
   const HINTS = { edit: 'drag to pan · drag objects to move · click colour · hold circle · L pencil · X random spawners · T run / pause · scroll zoom · Ctrl+Z undo · R reset · M muted colours · Tab play',
-                  play: 'move cursor to steer · click to change background · M muted colours · Tab edit',
-                  playMuted: 'move cursor to steer · M vivid colours · Tab edit' };
-  const hintFor = () => mode === 'play' && muted ? HINTS.playMuted : HINTS[mode].replace('M muted colours', muted ? 'M vivid colours' : 'M muted colours');
+                  play: 'move cursor to steer · click to shoot · M muted colours · Tab edit' };
+  const hintFor = () => HINTS[mode].replace('M muted colours', muted ? 'M vivid colours' : 'M muted colours');
   if (laptop) document.querySelector('#over small').textContent = 'Click or press Space to play again';
 
   // ----- Edit / Play -----
@@ -2354,7 +2438,7 @@
     get redSpawnerDock() { return { x: redX, y: redY - DOCK_GAP, r: SPAWNER_R }; }, get blueSpawnerDock() { return { x: blueX, y: blueY + DOCK_GAP, r: SPAWNER_R }; },
     get mode() { return mode; }, set mode(m) { setMode(m); }, get pencil() { return pencil; }, set pencil(v) { setPencil(v); },
     get fleeRange() { return FLEE_RANGE; }, set fleeRange(v) { FLEE_RANGE = +v; },
-    get simInEdit() { return simInEdit; }, set simInEdit(v) { simInEdit = !!v; syncPlayer(); }, set forcesOn(v) { forcesOn = !!v; }, get hue() { return hue; }, set hue(h) { hue = h; paint(); }, get forcesOn() { return forcesOn; },
+    get simInEdit() { return simInEdit; }, set simInEdit(v) { simInEdit = !!v; syncPlayer(); }, set forcesOn(v) { forcesOn = !!v; }, get hue() { return hue; }, set hue(h) { hue = h; paint(); }, shots, shoot: (x, y) => shoot(x, y, performance.now()), get shotStats() { return { fired: shotsFired, kills: shotKills, pops: shotPops, fizzles }; }, SHOT_COOLDOWN_MS, BG_HUE, VIVID_BG, get forcesOn() { return forcesOn; },
     get player() { return { x: W / 2, y: H / 2, r: player.r, eaten: player.eaten, score: sizePct(), peak: Math.round(player.peak * 100), caught: player.caught, size: player.size, gameOver: player.over,
       invulnerable: invulnerable(performance.now()), huntSafe: huntSafe(performance.now()), guard: player.guard, scale: player.scale, vx: player.vx, vy: player.vy,
       tilt: [tiltX, tiltY], neutral: neutral && [neutral.beta, neutral.gamma], on: playerOn }; },
